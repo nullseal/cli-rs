@@ -1,0 +1,7 @@
+dist-test
+test-results
+target
+npm/*/bin/
+.DS_Store
+.env.*local
+.env

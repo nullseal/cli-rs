@@ -1,0 +1,29 @@
+{
+  "name": "nullseal",
+  "version": "0.9.1",
+  "description": "NullSeal CLI — securely share secrets via encrypted server storage or P2P WebRTC transfer",
+  "license": "MIT",
+  "bin": {
+    "nullseal": "bin/nullseal.js"
+  },
+  "files": [
+    "bin"
+  ],
+  "optionalDependencies": {
+    "@nullseal/linux-x64": "0.9.1",
+    "@nullseal/linux-arm64": "0.9.1",
+    "@nullseal/darwin-arm64": "0.9.1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ltmin-home/nullseal"
+  },
+  "keywords": [
+    "secret",
+    "share",
+    "p2p",
+    "webrtc",
+    "cli",
+    "encryption"
+  ]
+}

@@ -1,0 +1,57 @@
+[package]
+name = "nullseal"
+version = "0.9.1"
+edition = "2021"
+
+[[bin]]
+name = "nullseal"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP — rustls with native OS certs (supports corporate proxies like Zscaler)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
+
+# Socket.io v4 over WebSocket (Phase 6) — minimal client via tungstenite
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
+
+# Async utilities (boxed futures for socket/webrtc callbacks)
+futures-util = "0.3"
+
+# Crypto — must be byte-compatible with Web Crypto API
+aes-gcm  = "0.10"
+pbkdf2   = "0.12"
+hmac     = "0.12"
+sha2     = "0.10"
+rand     = "0.8"
+base64   = "0.22"
+
+# Serialisation
+serde         = { version = "1", features = ["derive"] }
+serde_json    = "1"
+urlencoding   = "2"
+url           = "2"
+
+# Error handling
+thiserror = "1"
+anyhow    = "1"
+qr2term = "0.3.3"
+
+# mDNS — local network discovery for -n local P2P sharing
+mdns-sd = "0.11"
+
+# WebRTC — DataChannel only (Phase 7)
+# Always use vendored OpenSSL for portable cross-platform builds.
+str0m = { version = "0.20", default-features = false, features = ["openssl"] }
+openssl = { version = "0.10", features = ["vendored"] }
+
+[dev-dependencies]
+tokio       = { version = "1", features = ["full"] }
+wiremock    = "0.6"
+hex-literal = "0.4"
+tempfile    = "3"

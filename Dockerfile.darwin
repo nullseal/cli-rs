@@ -1,0 +1,62 @@
+# syntax=docker/dockerfile:1
+#
+# Cross-compiles the NullSeal CLI for macOS (aarch64-apple-darwin)
+# from a Linux Docker container using cargo-zigbuild.
+#
+# ── Build ────────────────────────────────────────────────────────────────────
+#
+#   docker buildx build -f Dockerfile.darwin --output dist-darwin/ .
+#
+# ── Notes ────────────────────────────────────────────────────────────────────
+#
+#   Uses Zig as the C/C++ cross-compiler and linker. This avoids needing
+#   the macOS SDK or osxcross toolchain. Vendored OpenSSL is compiled
+#   from source using Zig's C compiler targeting macOS.
+
+ARG RUST_VERSION=1.88
+ARG ZIG_VERSION=0.14.1
+
+# ── Stage 1: toolchain ──────────────────────────────────────────────────────
+FROM rust:${RUST_VERSION}-slim-bookworm AS builder
+
+ARG ZIG_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl xz-utils \
+    perl make \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install zig (detect host arch)
+RUN ARCH="$(uname -m)" \
+    && curl -L "https://ziglang.org/download/${ZIG_VERSION}/zig-${ARCH}-linux-${ZIG_VERSION}.tar.xz" \
+       | tar xJ -C /usr/local \
+    && ln -s "/usr/local/zig-${ARCH}-linux-${ZIG_VERSION}/zig" /usr/local/bin/zig
+
+# Install cargo-zigbuild
+RUN cargo install cargo-zigbuild --locked
+
+# Add macOS target
+RUN rustup target add aarch64-apple-darwin
+
+WORKDIR /app
+
+# ── Stage 2: cache dependencies ─────────────────────────────────────────────
+COPY Cargo.toml Cargo.lock build.rs ./
+RUN mkdir src \
+    && echo 'fn main(){}' > src/main.rs \
+    && touch .env \
+    && cargo zigbuild --release --target aarch64-apple-darwin \
+    && rm -rf src
+
+# ── Stage 3: build the real binary ──────────────────────────────────────────
+COPY src ./src
+COPY .env ./
+
+RUN touch src/main.rs \
+    && cargo zigbuild --release --target aarch64-apple-darwin
+
+RUN cp target/aarch64-apple-darwin/release/nullseal /nullseal
+
+# ── Stage 4: export ─────────────────────────────────────────────────────────
+FROM scratch
+COPY --from=builder /nullseal /nullseal
