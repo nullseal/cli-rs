@@ -2,7 +2,7 @@
 
 Encrypted sharing CLI — send secrets, files, and passwords securely from the terminal.
 
-**Website:** https://nullseal.com &nbsp;|&nbsp; **Repository:** https://github.com/nullseal/cli-rs
+**Website:** https://nullseal.com
 
 ---
 
@@ -31,9 +31,24 @@ nullseal --version
 
 The npm package selects the correct prebuilt binary for your platform automatically.
 
-### Download binary
+### Download binary directly from npm
 
-Download the binary for your platform from the [Releases](https://github.com/nullseal/cli-rs/releases) page and place it on your `$PATH`.
+Each platform binary is also published as a standalone npm tarball. Download and extract the one for your platform:
+
+| Platform | Package |
+|---|---|
+| Linux x64 | `npm pack @nullseal/linux-x64` |
+| Linux arm64 | `npm pack @nullseal/linux-arm64` |
+| macOS arm64 | `npm pack @nullseal/darwin-arm64` |
+
+Extract the tarball, make the binary executable, and place it on your `$PATH`:
+
+```bash
+npm pack @nullseal/darwin-arm64
+tar -xzf nullseal-darwin-arm64-*.tgz
+chmod +x package/bin/nullseal
+mv package/bin/nullseal /usr/local/bin/nullseal
+```
 
 ---
 
