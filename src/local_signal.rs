@@ -31,6 +31,13 @@ impl SignalServer {
         Ok(SignalServer { listener, addr })
     }
 
+    /// Bind to an exact address (ip:port). Fails if the port is already in use.
+    pub async fn bind_addr(addr: &str) -> Result<Self> {
+        let listener = TcpListener::bind(addr).await?;
+        let addr = listener.local_addr()?;
+        Ok(SignalServer { listener, addr })
+    }
+
     pub fn port(&self) -> u16 {
         self.addr.port()
     }
@@ -107,5 +114,35 @@ impl SignalChannel {
 
     pub async fn send_ready(&mut self) -> Result<()> {
         self.send(&serde_json::json!({"type": "ready"})).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn bind_returns_ephemeral_port() {
+        let server = SignalServer::bind().await.unwrap();
+        assert!(server.port() > 0);
+    }
+
+    #[tokio::test]
+    async fn bind_to_loopback() {
+        let server = SignalServer::bind_to("127.0.0.1").await.unwrap();
+        assert!(server.port() > 0);
+    }
+
+    #[tokio::test]
+    async fn bind_addr_specific_port() {
+        let server = SignalServer::bind_addr("127.0.0.1:0").await.unwrap();
+        assert!(server.port() > 0);
+    }
+
+    #[tokio::test]
+    async fn bind_addr_respects_explicit_port() {
+        // Bind to a specific port and verify it's actually used
+        let server = SignalServer::bind_addr("127.0.0.1:19876").await.unwrap();
+        assert_eq!(server.port(), 19876);
     }
 }

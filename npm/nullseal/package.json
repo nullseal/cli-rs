@@ -1,6 +1,6 @@
 {
   "name": "nullseal",
-  "version": "0.9.3",
+  "version": "0.11.0",
   "description": "NullSeal CLI — securely share secrets via encrypted server storage or P2P WebRTC transfer",
   "license": "MIT",
   "bin": {
@@ -10,9 +10,9 @@
     "bin"
   ],
   "optionalDependencies": {
-    "@nullseal/linux-x64": "0.9.3",
-    "@nullseal/linux-arm64": "0.9.3",
-    "@nullseal/darwin-arm64": "0.9.3"
+    "@nullseal/linux-x64": "0.11.0",
+    "@nullseal/linux-arm64": "0.11.0",
+    "@nullseal/darwin-arm64": "0.11.0"
   },
   "repository": {
     "type": "git",

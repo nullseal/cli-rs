@@ -551,3 +551,83 @@ fn build_rtc(local_addr: SocketAddr) -> Result<Rtc> {
     rtc.add_local_candidate(candidate);
     Ok(rtc)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    // ── is_private_lan_ip ────────────────────────────────────────────────
+
+    #[test]
+    fn private_10_x_is_lan() {
+        assert!(is_private_lan_ip(&IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_private_lan_ip(&IpAddr::V4(Ipv4Addr::new(10, 255, 255, 255))));
+    }
+
+    #[test]
+    fn private_172_16_is_lan() {
+        assert!(is_private_lan_ip(&IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(is_private_lan_ip(&IpAddr::V4(Ipv4Addr::new(172, 31, 255, 254))));
+    }
+
+    #[test]
+    fn private_172_32_is_not_lan() {
+        assert!(!is_private_lan_ip(&IpAddr::V4(Ipv4Addr::new(172, 32, 0, 1))));
+    }
+
+    #[test]
+    fn private_192_168_is_lan() {
+        assert!(is_private_lan_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1))));
+        assert!(is_private_lan_ip(&IpAddr::V4(Ipv4Addr::new(192, 168, 255, 254))));
+    }
+
+    #[test]
+    fn tailscale_cgnat_is_not_lan() {
+        // Tailscale uses 100.64.0.0/10 (CGNAT range)
+        assert!(!is_private_lan_ip(&IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(!is_private_lan_ip(&IpAddr::V4(Ipv4Addr::new(100, 127, 255, 254))));
+    }
+
+    #[test]
+    fn public_ip_is_not_lan() {
+        assert!(!is_private_lan_ip(&IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_private_lan_ip(&IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+    }
+
+    #[test]
+    fn loopback_is_not_lan() {
+        assert!(!is_private_lan_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+    }
+
+    #[test]
+    fn ipv6_is_not_lan() {
+        assert!(!is_private_lan_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    // ── discover_local_ip ────────────────────────────────────────────────
+
+    #[test]
+    fn discover_local_ip_returns_valid_ip() {
+        let ip = discover_local_ip();
+        // Should return something other than unspecified
+        assert!(!ip.is_unspecified());
+    }
+
+    // ── bind_udp ─────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn bind_udp_with_none_succeeds() {
+        let (socket, addr) = bind_udp(None).await.unwrap();
+        assert!(addr.port() > 0);
+        drop(socket);
+    }
+
+    #[tokio::test]
+    async fn bind_udp_with_explicit_ip_uses_that_ip() {
+        let ip = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+        let (_socket, addr) = bind_udp(Some(ip)).await.unwrap();
+        assert_eq!(addr.ip(), ip);
+        assert!(addr.port() > 0);
+    }
+}

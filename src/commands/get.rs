@@ -592,4 +592,100 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("wrong password"));
     }
+
+    // ── parse_share_url: additional edge cases ───────────────────────────
+
+    #[test]
+    fn parses_http_server_url() {
+        assert_eq!(
+            parse_share_url("http://localhost:3000/s/local123"),
+            ParsedUrl::Server { id: "local123".into() }
+        );
+    }
+
+    #[test]
+    fn parses_http_p2p_url() {
+        assert_eq!(
+            parse_share_url("http://localhost:3000/p2p/sess999"),
+            ParsedUrl::P2p { id: "sess999".into() }
+        );
+    }
+
+    #[test]
+    fn unknown_url_path_is_bare_id() {
+        // URL with unrecognized path should fall through to BareId
+        assert_eq!(
+            parse_share_url("https://nullseal.com/other/abc"),
+            ParsedUrl::BareId { id: "https://nullseal.com/other/abc".into() }
+        );
+    }
+
+    #[test]
+    fn empty_p2p_prefix_is_bare_id() {
+        // "p2p/" with no ID should be BareId
+        assert_eq!(
+            parse_share_url("p2p/"),
+            ParsedUrl::BareId { id: "p2p/".into() }
+        );
+    }
+
+    #[test]
+    fn empty_s_prefix_is_bare_id() {
+        // "s/" with no ID should be BareId
+        assert_eq!(
+            parse_share_url("s/"),
+            ParsedUrl::BareId { id: "s/".into() }
+        );
+    }
+
+    #[test]
+    fn short_id_is_bare_id() {
+        assert_eq!(
+            parse_share_url("x"),
+            ParsedUrl::BareId { id: "x".into() }
+        );
+    }
+
+    // ── server get: additional cases ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn decrypts_file_and_saves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let password = "testpass";
+        let content = b"file content here";
+        let r = encrypt_bytes(content, password);
+
+        let (server, url) = mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/shares/fid2/payload"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "contentType": "file",
+                "encryptedPayload": r.encrypted_payload,
+                "encryptionMetadata": {
+                    "algorithm": r.encryption_metadata.algorithm,
+                    "kdf": r.encryption_metadata.kdf,
+                    "iterations": r.encryption_metadata.iterations,
+                    "salt": r.encryption_metadata.salt,
+                    "iv": r.encryption_metadata.iv
+                },
+                "fileMetadata": { "filename": "test.pdf", "mimeType": "application/pdf", "size": 17, "extension": ".pdf" }
+            })))
+            .mount(&server)
+            .await;
+
+        let dir = tmp.path().to_str().unwrap().to_owned();
+        run("s/fid2", password, Some(dir.clone()), Some(url), &mut |_| {})
+            .await
+            .unwrap();
+
+        let saved = std::fs::read(Path::new(&dir).join("test.pdf")).unwrap();
+        assert_eq!(saved, content);
+    }
+
+    #[test]
+    fn bare_id_parsed_as_bare_id_variant() {
+        // Verify BareId is the parsed result for plain IDs
+        let parsed = parse_share_url("bare123");
+        assert_eq!(parsed, ParsedUrl::BareId { id: "bare123".into() });
+    }
 }

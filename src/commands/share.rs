@@ -52,7 +52,7 @@ fn validate(content: &str, password: &str, mode: &str, content_type: &str) -> Re
             }
             let size = std::fs::metadata(content).map(|m| m.len()).unwrap_or(0);
             if size > SERVER_MAX_BYTES {
-                bail!("File exceeds server upload limit (2 MB).");
+                bail!("File exceeds short-time upload limit (2 MB).");
             }
         }
     } else if content.trim().is_empty() {
@@ -144,13 +144,25 @@ pub async fn run_local(
     let result = encrypt_bytes(&bytes, &password);
     let proof = sha256_hex(&password);
 
-    // 2. Bind TCP signaling server
-    let local_ip = bind_addr.unwrap_or_else(|| {
-        crate::webrtc::discover_local_ip().to_string()
-    });
-    let signal_server = match SignalServer::bind_to(&local_ip).await {
-        Ok(s) => s,
-        Err(_) => SignalServer::bind().await?,
+    // 2. Parse bind address and bind TCP signaling server
+    let (local_ip, explicit_port) = match &bind_addr {
+        Some(a) if a.contains(':') => {
+            let mut parts = a.rsplitn(2, ':');
+            let port: u16 = parts.next().unwrap().parse()
+                .map_err(|_| anyhow::anyhow!("invalid port in address: {a}"))?;
+            let ip = parts.next().unwrap().to_string();
+            (ip, Some(port))
+        }
+        Some(ip) => (ip.clone(), None),
+        None => (crate::webrtc::discover_local_ip().to_string(), None),
+    };
+    let signal_server = if let Some(port) = explicit_port {
+        SignalServer::bind_addr(&format!("{local_ip}:{port}")).await?
+    } else {
+        match SignalServer::bind_to(&local_ip).await {
+            Ok(s) => s,
+            Err(_) => SignalServer::bind().await?,
+        }
     };
     let port = signal_server.port();
     let addr = format!("{local_ip}:{port}");
@@ -227,7 +239,7 @@ async fn run_inner(
     let content_type_flag = content_type_flag.into();
 
     if local && mode != "p2p" {
-        anyhow::bail!("-n local requires -m p2p");
+        anyhow::bail!("--local requires --p2p");
     }
 
     validate(&content, &password, &mode, &content_type_flag)?;
@@ -565,5 +577,131 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Request failed"));
+    }
+
+    // ── validate ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_ok_text() {
+        validate("hello", "password", "u", "txt").unwrap();
+    }
+
+    #[test]
+    fn validate_rejects_too_long_text() {
+        let long = "x".repeat(MAX_TEXT_LENGTH + 1);
+        let err = validate(&long, "password", "u", "txt").unwrap_err();
+        assert!(err.to_string().contains("characters"));
+    }
+
+    #[test]
+    fn validate_p2p_allows_any_file_extension() {
+        // In p2p mode, unsupported extensions should be allowed
+        validate("script.exe", "password", "p2p", "file").unwrap();
+    }
+
+    #[test]
+    fn validate_server_rejects_too_large_file() {
+        use std::io::Write;
+        // Write just over 2 MB to a temp file
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".pdf").unwrap();
+        // Create a sparse-like file by seeking past 2MB+1
+        let size = SERVER_MAX_BYTES + 1;
+        tmp.as_file().set_len(size).unwrap();
+        tmp.write_all(b"x").unwrap(); // force file creation
+        let path = tmp.path().to_str().unwrap().to_owned();
+        let err = validate(&path, "password", "u", "file").unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("limit"));
+    }
+
+    // ── resolve_content_type ─────────────────────────────────────────────
+
+    #[test]
+    fn resolve_content_type_file() {
+        assert_eq!(resolve_content_type("file"), "file");
+    }
+
+    #[test]
+    fn resolve_content_type_pwd() {
+        assert_eq!(resolve_content_type("pwd"), "password");
+    }
+
+    #[test]
+    fn resolve_content_type_txt() {
+        assert_eq!(resolve_content_type("txt"), "text");
+    }
+
+    #[test]
+    fn resolve_content_type_unknown_defaults_to_text() {
+        assert_eq!(resolve_content_type("xyz"), "text");
+    }
+
+    // ── file_extension ───────────────────────────────────────────────────
+
+    #[test]
+    fn file_extension_pdf() {
+        assert_eq!(file_extension("doc.PDF"), ".pdf");
+    }
+
+    #[test]
+    fn file_extension_none() {
+        assert_eq!(file_extension("Makefile"), "");
+    }
+
+    #[test]
+    fn file_extension_hidden_file() {
+        assert_eq!(file_extension(".gitignore"), "");
+    }
+
+    // ── run_inner: mode validation ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_inner_local_requires_p2p() {
+        let err = run_inner("hello", "password", "u", "txt", None, true, &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--local requires --p2p"));
+    }
+
+    // ── server upload: content types ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn server_upload_file_sends_file_content_type() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        tmp.write_all(b"content").unwrap();
+        let tmp_path = tmp.path().to_str().unwrap().to_owned();
+
+        let (server, url) = mock_server().await;
+        Mock::given(method("POST"))
+            .and(path("/shares"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(share_ok_body()))
+            .mount(&server)
+            .await;
+
+        run(tmp_path, "password", "u", "file", Some(url), &mut |_| {})
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(body["contentType"], "file");
+    }
+
+    #[tokio::test]
+    async fn server_upload_text_sends_text_content_type() {
+        let (server, url) = mock_server().await;
+        Mock::given(method("POST"))
+            .and(path("/shares"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(share_ok_body()))
+            .mount(&server)
+            .await;
+
+        run("hello world", "password", "u", "txt", Some(url), &mut |_| {})
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(body["contentType"], "text");
     }
 }

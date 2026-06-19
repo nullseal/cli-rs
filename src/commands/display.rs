@@ -130,8 +130,8 @@ pub fn print_local_share_result(addr: &str) {
         "📡 Local Transfer",
         &[
             ("Address:", addr),
-            ("CLI:", &format!("{CYAN}nullseal get -n local{RESET}")),
-            ("Direct:", &format!("{CYAN}nullseal get -n local -a {addr}{RESET}")),
+            ("CLI:", &format!("{CYAN}nullseal get --local{RESET}")),
+            ("Direct:", &format!("{CYAN}nullseal get --local -a {addr}{RESET}")),
         ],
         width,
     );
@@ -148,5 +148,47 @@ fn print_qr(url: &str) {
         for line in qr_string.lines() {
             eprintln!("  {line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_ansi_removes_escape_codes() {
+        let colored = format!("{CYAN}hello{RESET}");
+        assert_eq!(strip_ansi(&colored), "hello");
+    }
+
+    #[test]
+    fn strip_ansi_plain_text_unchanged() {
+        assert_eq!(strip_ansi("hello world"), "hello world");
+    }
+
+    #[test]
+    fn display_width_ascii() {
+        assert_eq!(display_width("hello"), 5);
+    }
+
+    #[test]
+    fn display_width_emoji() {
+        // Non-ASCII chars counted as width 2
+        assert_eq!(display_width("📡"), 2);
+    }
+
+    #[test]
+    fn display_width_mixed() {
+        assert_eq!(display_width("a📡b"), 4); // 1 + 2 + 1
+    }
+
+    #[test]
+    fn hline_generates_correct_width() {
+        assert_eq!(hline(5), "─────");
+    }
+
+    #[test]
+    fn hline_zero_is_empty() {
+        assert_eq!(hline(0), "");
     }
 }
