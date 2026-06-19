@@ -16,9 +16,17 @@ pub struct SignalServer {
 }
 
 impl SignalServer {
-    /// Bind on an ephemeral port. Returns the bound address.
+    /// Bind on an ephemeral port on all interfaces. Returns the bound address.
     pub async fn bind() -> Result<Self> {
         let listener = TcpListener::bind("0.0.0.0:0").await?;
+        let addr = listener.local_addr()?;
+        Ok(SignalServer { listener, addr })
+    }
+
+    /// Bind on a specific IP with an ephemeral port.
+    /// Use this when the advertised IP must match the listening interface.
+    pub async fn bind_to(ip: &str) -> Result<Self> {
+        let listener = TcpListener::bind(format!("{ip}:0")).await?;
         let addr = listener.local_addr()?;
         Ok(SignalServer { listener, addr })
     }

@@ -185,7 +185,7 @@ async fn run_p2p(
     };
 
     // 7. Create WebRTC receiver peer from offer, send answer back
-    let mut receiver = ReceiverPeer::from_offer(offer, ice_servers).await?;
+    let mut receiver = ReceiverPeer::from_offer(offer, ice_servers, None).await?;
     socket.send_answer(receiver.answer_sdp_json()).await?;
 
     // 8. Relay ICE candidates while waiting for DataChannel open
@@ -289,7 +289,10 @@ pub async fn run_local(
     };
 
     // 4. Create WebRTC receiver peer from offer, send answer back
-    let mut receiver = ReceiverPeer::from_offer(offer, vec![]).await?;
+    let bind_ip: Option<std::net::IpAddr> = addr.split(':')
+        .next()
+        .and_then(|h| h.parse().ok());
+    let mut receiver = ReceiverPeer::from_offer(offer, vec![], bind_ip).await?;
     signal.send_answer(receiver.answer_sdp_json()).await?;
 
     // 5. Wait for DataChannel open

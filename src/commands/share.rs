@@ -145,11 +145,14 @@ pub async fn run_local(
     let proof = sha256_hex(&password);
 
     // 2. Bind TCP signaling server
-    let signal_server = SignalServer::bind().await?;
-    let port = signal_server.port();
     let local_ip = bind_addr.unwrap_or_else(|| {
         crate::webrtc::discover_local_ip().to_string()
     });
+    let signal_server = match SignalServer::bind_to(&local_ip).await {
+        Ok(s) => s,
+        Err(_) => SignalServer::bind().await?,
+    };
+    let port = signal_server.port();
     let addr = format!("{local_ip}:{port}");
 
     // 3. Display local share info
@@ -163,7 +166,8 @@ pub async fn run_local(
     eprintln!("\x1b[1;32m✓\x1b[0m Recipient connected. Starting transfer…");
 
     // 6. Create WebRTC sender peer + offer
-    let mut sender = SenderPeer::new(vec![]).await?;
+    let bind_ip: Option<std::net::IpAddr> = local_ip.parse().ok();
+    let mut sender = SenderPeer::new(vec![], bind_ip).await?;
     signal.send_offer(sender.offer_sdp_json()).await?;
 
     // 7. Wait for answer
@@ -338,7 +342,7 @@ async fn run_p2p(
     eprintln!("\x1b[1;32m✓\x1b[0m Recipient connected. Starting transfer…");
 
     // 7. Create WebRTC sender peer + offer
-    let mut sender = SenderPeer::new(ice_servers).await?;
+    let mut sender = SenderPeer::new(ice_servers, None).await?;
     socket.send_offer(sender.offer_sdp_json()).await?;
 
     // 8. Wait for answer + relay ICE candidates concurrently

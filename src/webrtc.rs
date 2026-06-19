@@ -60,6 +60,16 @@ pub enum LoopEvent {
 }
 
 pub fn discover_local_ip() -> std::net::IpAddr {
+    // Try to find a real LAN IP first, falling back to any routable IP.
+    // On multi-homed hosts (e.g., Tailscale + LAN), prefer the LAN IP
+    // because Tailscale IPs (100.64.0.0/10) don't work for same-machine
+    // TCP connections on macOS (traffic goes through the tunnel instead
+    // of kernel loopback).
+    if let Some(lan_ip) = discover_lan_ip() {
+        return lan_ip;
+    }
+
+    // Fallback: probe via UDP connect to find any outbound IP
     std::net::UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| {
             s.connect("8.8.8.8:80")?;
@@ -69,10 +79,57 @@ pub fn discover_local_ip() -> std::net::IpAddr {
         .unwrap_or(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST))
 }
 
-async fn bind_udp() -> Result<(UdpSocket, SocketAddr)> {
+/// Discover a LAN-suitable IP by enumerating network interfaces.
+/// Skips loopback, Tailscale (100.64.0.0/10), link-local, and other non-LAN IPs.
+/// Returns None if no private LAN interface is found.
+fn discover_lan_ip() -> Option<std::net::IpAddr> {
+    let output = std::process::Command::new("ifconfig")
+        .output()
+        .or_else(|_| std::process::Command::new("ip").args(["addr", "show"]).output())
+        .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("inet ") {
+            let ip_str = rest.split(|c: char| c.is_whitespace() || c == '/')
+                .next()
+                .unwrap_or("");
+            if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+                if is_private_lan_ip(&std::net::IpAddr::V4(ip)) {
+                    return Some(std::net::IpAddr::V4(ip));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Check if an IP is a standard private/LAN address (not Tailscale/CGNAT).
+fn is_private_lan_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            // 10.0.0.0/8
+            if o[0] == 10 { return true; }
+            // 172.16.0.0/12
+            if o[0] == 172 && (o[1] & 0xF0) == 16 { return true; }
+            // 192.168.0.0/16
+            if o[0] == 192 && o[1] == 168 { return true; }
+            false
+        }
+        _ => false,
+    }
+}
+
+async fn bind_udp(bind_ip: Option<std::net::IpAddr>) -> Result<(UdpSocket, SocketAddr)> {
+    let ip = bind_ip.unwrap_or_else(discover_local_ip);
+    // Always bind to 0.0.0.0 so the socket can receive from any interface.
+    // Use the specified/discovered IP only for the ICE candidate address.
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     let port = socket.local_addr()?.port();
-    let effective_addr = SocketAddr::new(discover_local_ip(), port);
+    let effective_addr = SocketAddr::new(ip, port);
     Ok((socket, effective_addr))
 }
 
@@ -257,8 +314,8 @@ pub struct SenderPeer {
 }
 
 impl SenderPeer {
-    pub async fn new(_ice_servers: Vec<ApiIceServer>) -> Result<Self> {
-        let (socket, local_addr) = bind_udp().await?;
+    pub async fn new(_ice_servers: Vec<ApiIceServer>, bind_ip: Option<std::net::IpAddr>) -> Result<Self> {
+        let (socket, local_addr) = bind_udp(bind_ip).await?;
         let mut rtc = build_rtc(local_addr)?;
 
         let mut api = rtc.sdp_api();
@@ -370,8 +427,9 @@ impl ReceiverPeer {
     pub async fn from_offer(
         offer_payload: Value,
         _ice_servers: Vec<ApiIceServer>,
+        bind_ip: Option<std::net::IpAddr>,
     ) -> Result<Self> {
-        let (socket, local_addr) = bind_udp().await?;
+        let (socket, local_addr) = bind_udp(bind_ip).await?;
         let mut rtc = build_rtc(local_addr)?;
 
         let offer_sdp_str = offer_payload["sdp"]["sdp"]
