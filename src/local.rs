@@ -28,6 +28,7 @@ pub fn broadcast(share_url: &str) -> Result<BroadcastGuard> {
 
 /// Discover a nullseal share on the local network via mDNS.
 /// Waits up to `timeout` for a broadcast, returns the share URL.
+#[allow(dead_code)]
 pub fn discover(timeout: Duration) -> Result<String> {
     let mdns = ServiceDaemon::new()?;
     let receiver = mdns.browse(SERVICE_TYPE)?;

@@ -109,17 +109,7 @@ pub async fn run(
     run_inner(content, password, mode, content_type_flag, server, false, output).await
 }
 
-/// Same as `run` but broadcasts the P2P URL on the local network via mDNS.
-pub async fn run_with_local(
-    content: impl Into<String>,
-    password: impl Into<String>,
-    mode: impl Into<String>,
-    content_type_flag: impl Into<String>,
-    server: Option<String>,
-    output: &mut dyn FnMut(&str),
-) -> Result<()> {
-    run_inner(content, password, mode, content_type_flag, server, true, output).await
-}
+
 
 /// Fully local transfer — no server needed.
 /// Sender binds a TCP signaling server, does WebRTC locally.
@@ -128,7 +118,7 @@ pub async fn run_local(
     password: impl Into<String>,
     content_type_flag: impl Into<String>,
     bind_addr: Option<String>,
-    output: &mut dyn FnMut(&str),
+    _output: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let content = content.into();
     let password = password.into();
@@ -298,7 +288,7 @@ async fn run_p2p(
     content_type_flag: String,
     server: Option<String>,
     local: bool,
-    output: &mut dyn FnMut(&str),
+    _output: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let base = server_url(server.as_deref())?;
     let client = ApiClient::new(&base);

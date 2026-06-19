@@ -480,7 +480,7 @@ impl ReceiverPeer {
         let mut chunks: Vec<String> = Vec::new();
         let mut total_size: usize = 0;
         let mut received: usize = 0;
-        let mut verified = false;
+        let mut _verified = false;
 
         loop {
             match self.event_rx.recv().await {
@@ -495,7 +495,7 @@ impl ReceiverPeer {
                             if proof != expected_proof {
                                 bail!("Wrong password.");
                             }
-                            verified = true;
+                            _verified = true;
                         }
                         Some("metadata") => {
                             content_type = v["contentType"]

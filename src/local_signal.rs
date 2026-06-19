@@ -3,7 +3,7 @@
 /// Protocol: newline-delimited JSON over a single TCP connection.
 /// Message types: offer, answer, ice, ready, error.
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -112,9 +112,6 @@ impl SignalChannel {
         self.send(&serde_json::json!({"type": "answer", "sdp": sdp})).await
     }
 
-    pub async fn send_ready(&mut self) -> Result<()> {
-        self.send(&serde_json::json!({"type": "ready"})).await
-    }
 }
 
 #[cfg(test)]

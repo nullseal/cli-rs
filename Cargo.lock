@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "nullseal"
-version = "0.11.0"
+version = "0.11.1"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1128,6 +1128,7 @@ dependencies = [
  "qr2term",
  "rand 0.8.6",
  "reqwest",
+ "rpassword",
  "serde",
  "serde_json",
  "sha2",
@@ -1598,6 +1599,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rpassword"
+version = "5.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffc936cf8a7ea60c58f030fd36a612a48f440610214dc54bc36431f9ea0c3efb"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "rustc-hash"
 version = "2.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1613,7 +1624,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

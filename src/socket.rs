@@ -187,11 +187,6 @@ impl P2PSocket {
         Ok(())
     }
 
-    pub async fn send_ice(&self, candidate: Value) -> Result<()> {
-        self.tx.send(encode_event("p2p:ice", &json!({ "candidate": candidate })))?;
-        Ok(())
-    }
-
     pub async fn done(&self) -> Result<()> {
         self.tx.send(encode_event("p2p:done", &json!({})))?;
         Ok(())

@@ -51,14 +51,14 @@ enum Commands {
         content: String,
         #[arg(short, long, help = "Encryption password (prompted if omitted)")]
         password: Option<String>,
-        // -- value-based flags (legacy) --
+        // -- value-based flags --
         #[arg(short, long, help = "Transfer mode: u=short-time upload, p2p=peer-to-peer")]
         mode: Option<String>,
         #[arg(short = 't', long = "type", help = "Content type: txt, file")]
         content_type: Option<String>,
         #[arg(short = 'n', long = "network", help = "Network mode: local")]
         network: Option<String>,
-        // -- boolean flags (new) --
+        // -- boolean flags --
         #[arg(long, help = "Share as file")]
         file: bool,
         #[arg(long, help = "Share as text (default)")]
@@ -81,7 +81,7 @@ enum Commands {
         password: Option<String>,
         #[arg(short, long, help = "Output directory for received files")]
         output: Option<String>,
-        // -- value-based flag (legacy) --
+        // -- value-based flag --
         #[arg(short = 'n', long = "network", help = "Network mode: local")]
         network: Option<String>,
         // -- boolean flag (new) --
@@ -96,9 +96,7 @@ enum Commands {
 fn prompt_password() -> String {
     eprint!("\x1b[1;33m🔑 Password:\x1b[0m ");
     io::stderr().flush().ok();
-    let mut password = String::new();
-    io::stdin().read_line(&mut password).unwrap_or(0);
-    password.trim().to_owned()
+    rpassword::read_password().unwrap_or_default()
 }
 
 #[tokio::main]

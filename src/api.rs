@@ -51,6 +51,7 @@ pub struct CreateShareRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct CreateShareResponse {
     pub share_id: String,
     pub share_url: String,
@@ -69,6 +70,7 @@ pub struct SharePayloadResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct ShareFileMetadata {
     pub filename: String,
     pub mime_type: String,
@@ -78,6 +80,7 @@ pub struct ShareFileMetadata {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct CreateP2PSessionResponse {
     pub session_id: String,
     pub share_url: String,
@@ -87,6 +90,7 @@ pub struct CreateP2PSessionResponse {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct P2PSession {
     pub session_id: String,
     pub status: String,
@@ -95,6 +99,7 @@ pub struct P2PSession {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
 pub struct IceServer {
     pub urls: serde_json::Value,
 }
