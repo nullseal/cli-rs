@@ -15,6 +15,8 @@ mod webrtc;
   -p, --password <PW>    Encryption password (prompted if omitted)
   -m, --mode <MODE>      Transfer mode: u | p2p
   -t, --type <TYPE>      Content type: txt | file
+  -T, --ttl <TTL>        Expiration: e.g. 1h, 24h, 3d, 7d (default: 24h, max: 7d)
+  -1, --one-time         One-time read (default; negate with --no-one-time)
   -n, --network <NET>    Network mode: local
       --file             Share as file
       --text             Share as text (default)
@@ -32,6 +34,8 @@ mod webrtc;
 
 \x1b[1;4mExamples:\x1b[0m
   nullseal share \"hello world\" -p mypass
+  nullseal share \"secret\" -p mypass -T 1h
+  nullseal share \"secret\" -p mypass --ttl 3d --no-one-time
   nullseal share ./doc.pdf -p mypass --file
   nullseal share \"secret\" -p mypass --p2p
   nullseal share \"secret\" -p mypass --local
@@ -72,6 +76,12 @@ enum Commands {
         #[arg(short = 'a', long = "address",
               help = "Bind address for local transfer (default: auto-detect)")]
         address: Option<String>,
+        #[arg(short = 'T', long = "ttl",
+              help = "Expiration: e.g. 1h, 24h, 3d, 7d (default: 24h, max: 7d)")]
+        ttl: Option<String>,
+        #[arg(short = '1', long = "one-time", default_value_t = true,
+              help = "One-time read (default: true; negate with --no-one-time)")]
+        one_time: bool,
     },
     #[command(about = "Retrieve and decrypt a share")]
     Get {
@@ -104,7 +114,7 @@ async fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Commands::Share { content, password, mode, content_type, network, file, text, p2p, upload, local, address } => {
+        Commands::Share { content, password, mode, content_type, network, file, text, p2p, upload, local, address, ttl, one_time } => {
             let password = password.unwrap_or_else(prompt_password);
 
             // Merge -n local / --local
@@ -157,7 +167,7 @@ async fn main() {
                     std::process::exit(1);
                 }
                 let resolved_mode = if p2p { "p2p" } else { "u" };
-                commands::share::run(content, password, resolved_mode, resolved_content_type, None, &mut |s| println!("{s}")).await
+                commands::share::run(content, password, resolved_mode, resolved_content_type, None, ttl, one_time, &mut |s| println!("{s}")).await
             }
         }
         Commands::Get { url, password, output, network, local, address } => {

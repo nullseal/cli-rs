@@ -63,6 +63,8 @@ nullseal share <content> [options]
 | Option | Default | Description |
 |---|---|---|
 | `-p, --password` | (prompted) | Encryption password |
+| `-T, --ttl` | `24h` | Expiration: e.g. `1h`, `24h`, `3d`, `7d` (max: 7d) |
+| `-1, --one-time` | ✓ | One-time read (negate with `--no-one-time`) |
 | `--file` | — | Share as file |
 | `--text` | ✓ | Share as text (default) |
 | `--p2p` | — | Peer-to-peer transfer via server signaling |
@@ -78,6 +80,12 @@ nullseal share <content> [options]
 ```bash
 # Upload text to server (recipient gets a link)
 nullseal share "my secret" -p hunter2
+
+# Set a custom TTL (1 hour)
+nullseal share "my secret" -p hunter2 -T 1h
+
+# Allow multiple reads (disable one-time read) with 3-day expiry
+nullseal share "my secret" -p hunter2 --ttl 3d --no-one-time
 
 # Upload a file
 nullseal share ./report.pdf --file -p hunter2

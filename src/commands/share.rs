@@ -11,6 +11,8 @@ use crate::webrtc::SenderPeer;
 const MIN_PASSWORD_LEN: usize = 3;
 const SERVER_MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MB
 const MAX_TEXT_LENGTH: usize = 100_000;
+const MAX_TTL_SECS: u64 = 7 * 24 * 3600; // 7 days
+const DEFAULT_TTL_SECS: u64 = 24 * 3600; // 24 hours
 
 use super::SUPPORTED_EXTENSIONS;
 
@@ -104,9 +106,11 @@ pub async fn run(
     mode: impl Into<String>,
     content_type_flag: impl Into<String>,
     server: Option<String>,
+    ttl: Option<String>,
+    one_time: bool,
     output: &mut dyn FnMut(&str),
 ) -> Result<()> {
-    run_inner(content, password, mode, content_type_flag, server, false, output).await
+    run_inner(content, password, mode, content_type_flag, server, false, ttl, one_time, output).await
 }
 
 
@@ -221,6 +225,8 @@ async fn run_inner(
     content_type_flag: impl Into<String>,
     server: Option<String>,
     local: bool,
+    ttl: Option<String>,
+    one_time: bool,
     output: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let content = content.into();
@@ -237,7 +243,8 @@ async fn run_inner(
     if mode == "p2p" {
         return run_p2p(content, password, content_type_flag, server, local, output).await;
     }
-    run_server(content, password, content_type_flag, server, output).await
+    let ttl_secs = parse_ttl(ttl.as_deref())?;
+    run_server(content, password, content_type_flag, server, ttl_secs, one_time, output).await
 }
 
 async fn run_server(
@@ -245,6 +252,8 @@ async fn run_server(
     password: String,
     content_type_flag: String,
     server: Option<String>,
+    ttl_secs: u64,
+    one_time: bool,
     output: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let client = ApiClient::new(server_url(server.as_deref())?);
@@ -260,8 +269,8 @@ async fn run_server(
             encrypted_payload: result.encrypted_payload,
             encryption_metadata: result.encryption_metadata,
             file_metadata,
-            one_time_read: true,
-            expires_at: expires_at_7_days(),
+            one_time_read: one_time,
+            expires_at: expires_at(ttl_secs),
         })
         .await?;
 
@@ -416,13 +425,36 @@ async fn run_p2p(
     Ok(())
 }
 
-fn expires_at_7_days() -> String {
+fn parse_ttl(ttl: Option<&str>) -> Result<u64> {
+    let s = match ttl {
+        Some(v) => v.trim(),
+        None => return Ok(DEFAULT_TTL_SECS),
+    };
+    let (num_str, multiplier) = if let Some(n) = s.strip_suffix('h') {
+        (n, 3600u64)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86400u64)
+    } else {
+        bail!("Invalid TTL format: \"{s}\". Use e.g. 1h, 24h, 3d, 7d.");
+    };
+    let num: u64 = num_str.parse().map_err(|_| anyhow::anyhow!("Invalid TTL number: \"{num_str}\"."))?;
+    if num == 0 {
+        bail!("TTL must be at least 1h.");
+    }
+    let secs = num * multiplier;
+    if secs > MAX_TTL_SECS {
+        bail!("TTL cannot exceed 7 days (168h).");
+    }
+    Ok(secs)
+}
+
+fn expires_at(ttl_secs: u64) -> String {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs()
-        + 7 * 24 * 3600;
+        + ttl_secs;
     unix_to_iso(secs)
 }
 
@@ -487,7 +519,7 @@ mod tests {
             .await;
 
         // Rich display now goes to stderr; just verify the command succeeds
-        run("hello", "password", "u", "txt", Some(url), &mut |_| {})
+        run("hello", "password", "u", "txt", Some(url), None, true, &mut |_| {})
             .await
             .unwrap();
     }
@@ -501,7 +533,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run("hunter2", "password", "u", "pwd", Some(url), &mut |_| {})
+        run("hunter2", "password", "u", "pwd", Some(url), None, true, &mut |_| {})
             .await
             .unwrap();
 
@@ -512,19 +544,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_short_password() {
-        let err = run("hi", "ab", "u", "txt", None, &mut |_| {}).await.unwrap_err();
+        let err = run("hi", "ab", "u", "txt", None, None, true, &mut |_| {}).await.unwrap_err();
         assert!(err.to_string().contains("Password"));
     }
 
     #[tokio::test]
     async fn rejects_empty_content() {
-        let err = run("   ", "password", "u", "txt", None, &mut |_| {}).await.unwrap_err();
+        let err = run("   ", "password", "u", "txt", None, None, true, &mut |_| {}).await.unwrap_err();
         assert!(err.to_string().contains("empty"));
     }
 
     #[tokio::test]
     async fn rejects_unsupported_extension() {
-        let err = run("script.exe", "password", "u", "file", None, &mut |_| {})
+        let err = run("script.exe", "password", "u", "file", None, None, true, &mut |_| {})
             .await
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("unsupported"));
@@ -544,7 +576,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run(tmp_path, "password", "u", "file", Some(url), &mut |_| {})
+        run(tmp_path, "password", "u", "file", Some(url), None, true, &mut |_| {})
             .await
             .unwrap();
 
@@ -563,7 +595,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run("hello", "password", "u", "txt", Some(url), &mut |_| {})
+        let err = run("hello", "password", "u", "txt", Some(url), None, true, &mut |_| {})
             .await
             .unwrap_err();
         assert!(err.to_string().contains("Request failed"));
@@ -646,7 +678,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_inner_local_requires_p2p() {
-        let err = run_inner("hello", "password", "u", "txt", None, true, &mut |_| {})
+        let err = run_inner("hello", "password", "u", "txt", None, true, None, true, &mut |_| {})
             .await
             .unwrap_err();
         assert!(err.to_string().contains("--local requires --p2p"));
@@ -668,7 +700,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run(tmp_path, "password", "u", "file", Some(url), &mut |_| {})
+        run(tmp_path, "password", "u", "file", Some(url), None, true, &mut |_| {})
             .await
             .unwrap();
 
@@ -686,12 +718,94 @@ mod tests {
             .mount(&server)
             .await;
 
-        run("hello world", "password", "u", "txt", Some(url), &mut |_| {})
+        run("hello world", "password", "u", "txt", Some(url), None, true, &mut |_| {})
             .await
             .unwrap();
 
         let reqs = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
         assert_eq!(body["contentType"], "text");
+    }
+
+    // ── parse_ttl ────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_ttl_default_is_24h() {
+        assert_eq!(parse_ttl(None).unwrap(), 24 * 3600);
+    }
+
+    #[test]
+    fn parse_ttl_hours() {
+        assert_eq!(parse_ttl(Some("1h")).unwrap(), 3600);
+        assert_eq!(parse_ttl(Some("48h")).unwrap(), 48 * 3600);
+        assert_eq!(parse_ttl(Some("168h")).unwrap(), 168 * 3600);
+    }
+
+    #[test]
+    fn parse_ttl_days() {
+        assert_eq!(parse_ttl(Some("1d")).unwrap(), 86400);
+        assert_eq!(parse_ttl(Some("7d")).unwrap(), 7 * 86400);
+    }
+
+    #[test]
+    fn parse_ttl_rejects_over_7d() {
+        let err = parse_ttl(Some("8d")).unwrap_err();
+        assert!(err.to_string().contains("7 days"));
+        let err = parse_ttl(Some("169h")).unwrap_err();
+        assert!(err.to_string().contains("7 days"));
+    }
+
+    #[test]
+    fn parse_ttl_rejects_zero() {
+        let err = parse_ttl(Some("0h")).unwrap_err();
+        assert!(err.to_string().contains("at least"));
+    }
+
+    #[test]
+    fn parse_ttl_rejects_invalid_format() {
+        let err = parse_ttl(Some("24")).unwrap_err();
+        assert!(err.to_string().contains("Invalid TTL format"));
+        let err = parse_ttl(Some("abc")).unwrap_err();
+        assert!(err.to_string().contains("Invalid TTL format"));
+    }
+
+    // ── one_time flag ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn server_upload_respects_one_time_false() {
+        let (server, url) = mock_server().await;
+        Mock::given(method("POST"))
+            .and(path("/shares"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(share_ok_body()))
+            .mount(&server)
+            .await;
+
+        run("hello", "password", "u", "txt", Some(url), None, false, &mut |_| {})
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(body["oneTimeRead"], false);
+    }
+
+    #[tokio::test]
+    async fn server_upload_respects_custom_ttl() {
+        let (server, url) = mock_server().await;
+        Mock::given(method("POST"))
+            .and(path("/shares"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(share_ok_body()))
+            .mount(&server)
+            .await;
+
+        run("hello", "password", "u", "txt", Some(url), Some("1h".into()), true, &mut |_| {})
+            .await
+            .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        // expiresAt should be roughly 1h from now, not 7d
+        let expires = body["expiresAt"].as_str().unwrap();
+        assert!(!expires.is_empty());
     }
 }

@@ -20,8 +20,8 @@ npx nullseal share "my secret" -p mypassword
 
 - **Zero-knowledge** — Your data is encrypted locally before transmission. The server stores only encrypted blobs it cannot read.
 - **Password-protected** — Every share requires a password. Without it, the content is unreadable — even to us.
-- **One-time read** — Server shares self-destruct after the first read. Nobody can access them again.
-- **Auto-expiry** — Shares expire automatically within 7 days, even if never read.
+- **One-time read** — Server shares self-destruct after the first read by default. Use `--no-one-time` to allow multiple reads.
+- **Auto-expiry** — Shares expire automatically (default 24 hours, max 7 days). Control with `--ttl`.
 - **P2P mode** — Transfer directly between devices using peer-to-peer connections. Data never touches the server.
 - **Cross-platform** — Works on macOS (Intel & Apple Silicon) and Linux (x64 & arm64). Share between CLI and web seamlessly.
 
@@ -104,6 +104,8 @@ nullseal get <url-or-id> [options]
 |------|-------------|--------|
 | `-m, --mode` | Transfer mode: `u` (server upload) or `p2p` (peer-to-peer) | `u` |
 | `-t, --type` | Content type: `txt`, `pwd`, or `file` | `txt` |
+| `-T, --ttl` | Expiration: e.g. `1h`, `24h`, `3d`, `7d` (max: 7d) | `24h` |
+| `-1, --one-time` | One-time read (negate with `--no-one-time`) | on |
 | `-n, --network` | Network mode: `local` = fully local transfer (no server) | off |
 | `-a, --address` | Bind address for local transfer (default: auto-detect) | auto |
 
