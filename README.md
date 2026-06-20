@@ -180,6 +180,8 @@ The backend and frontend source code are intentionally kept private. **You do no
 
 This repository is the only component you need to audit. You can clone it, read the source in [`src/crypto.rs`](src/crypto.rs), and build your own binary to verify the implementation.
 
+![Safety Proof](assets/safety-proof.png)
+
 | Property | Value |
 |---|---|
 | Cipher | AES-256-GCM |
