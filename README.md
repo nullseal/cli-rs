@@ -4,6 +4,7 @@ Encrypted sharing CLI — send secrets, files, and passwords securely from the t
 
 **Website:** https://nullseal.com
 
+![Safety Proof](assets/safety-proof.png)
 ---
 
 ## Features
@@ -179,8 +180,6 @@ nullseal manage "shareId@ownerSecret" -c destroy
 The backend and frontend source code are intentionally kept private. **You do not need to trust the server** — all encryption and decryption happen locally inside the CLI before any data is sent or after it is received. The server only ever stores ciphertext it cannot read.
 
 This repository is the only component you need to audit. You can clone it, read the source in [`src/crypto.rs`](src/crypto.rs), and build your own binary to verify the implementation.
-
-![Safety Proof](assets/safety-proof.png)
 
 | Property | Value |
 |---|---|

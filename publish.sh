@@ -131,11 +131,5 @@ CLI_APPS_CORE_URL=http://127.0.0.1:3001
 CLI_APPS_USER_URL=http://127.0.0.1:3000
 EOF
 
-cd "$SCRIPT_DIR/.."
-git add cli-rs/
-git commit -m "cli: v$VERSION"
-git tag "cli-v$VERSION"
-git push && git push --tags
-
 echo ""
 echo "🚀 Published nullseal@$VERSION"
