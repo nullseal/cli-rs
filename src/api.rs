@@ -8,7 +8,7 @@ use crate::crypto::{ChallengeMetadata, EncryptionMetadata};
 
 #[derive(Debug, Error)]
 pub enum ApiError {
-    #[error("Share not found or already read")]
+    #[error("Share not found or already destroyed")]
     ShareUnavailable,
     #[error("Wrong password")]
     WrongPassword,
