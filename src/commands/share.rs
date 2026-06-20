@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::{bail, Result};
 
 use crate::api::{ApiClient, CreateShareRequest, FileMetadata};
-use crate::crypto::{encrypt_bytes, sha256_hex};
+use crate::crypto::{encrypt_bytes, generate_challenge, sha256_hex};
 use crate::local_signal::SignalServer;
 use crate::socket::P2PSocket;
 use crate::webrtc::SenderPeer;
@@ -260,6 +260,7 @@ async fn run_server(
     let content_type = resolve_content_type(&content_type_flag);
     let ReadInput { bytes, file_metadata } = read_input(&content, content_type)?;
     let result = encrypt_bytes(&bytes, &password);
+    let challenge = generate_challenge(&password);
 
     let total = result.encrypted_payload.len();
     output(&format!("Uploading {} bytes…", total));
@@ -271,6 +272,9 @@ async fn run_server(
             file_metadata,
             one_time_read: one_time,
             expires_at: expires_at(ttl_secs),
+            challenge_plaintext: challenge.challenge_plaintext,
+            encrypted_challenge: challenge.encrypted_challenge,
+            challenge_metadata: challenge.challenge_metadata,
         })
         .await?;
 

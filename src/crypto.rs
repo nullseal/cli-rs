@@ -90,6 +90,66 @@ pub fn sha256_hex(text: &str) -> String {
     format!("{hash:x}")
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChallengeMetadata {
+    pub salt: String,
+    pub iv: String,
+    pub iterations: u32,
+}
+
+pub struct ChallengeResult {
+    pub challenge_plaintext: String,
+    pub encrypted_challenge: String,
+    pub challenge_metadata: ChallengeMetadata,
+}
+
+pub fn generate_challenge(password: &str) -> ChallengeResult {
+    let mut rng = rand::thread_rng();
+    let mut random = [0u8; 32];
+    rng.fill_bytes(&mut random);
+    let challenge_plaintext: String = random.iter().map(|b| format!("{b:02x}")).collect();
+
+    let mut salt = [0u8; SALT_LEN];
+    let mut iv = [0u8; IV_LEN];
+    rng.fill_bytes(&mut salt);
+    rng.fill_bytes(&mut iv);
+
+    let key = derive_key(password, &salt, ITERATIONS);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&iv), challenge_plaintext.as_bytes())
+        .expect("AES-GCM encryption should not fail");
+
+    ChallengeResult {
+        challenge_plaintext,
+        encrypted_challenge: B64.encode(&ciphertext),
+        challenge_metadata: ChallengeMetadata {
+            salt: B64.encode(salt),
+            iv: B64.encode(iv),
+            iterations: ITERATIONS,
+        },
+    }
+}
+
+pub fn decrypt_challenge(
+    encrypted_challenge: &str,
+    metadata: &ChallengeMetadata,
+    password: &str,
+) -> Result<String, CryptoError> {
+    let salt = B64.decode(&metadata.salt).map_err(|_| CryptoError::DecryptFailed)?;
+    let iv = B64.decode(&metadata.iv).map_err(|_| CryptoError::DecryptFailed)?;
+    let ciphertext = B64.decode(encrypted_challenge).map_err(|_| CryptoError::DecryptFailed)?;
+
+    let key = derive_key(password, &salt, metadata.iterations);
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&iv), ciphertext.as_ref())
+        .map_err(|_| CryptoError::DecryptFailed)?;
+
+    String::from_utf8(plaintext).map_err(|_| CryptoError::DecryptFailed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

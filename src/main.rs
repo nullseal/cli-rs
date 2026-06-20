@@ -32,6 +32,14 @@ mod webrtc;
       --local            Discover sender via mDNS on local network
   -a, --address <ADDR>   Direct host:port for local transfer
 
+\x1b[1;4mManage options:\x1b[0m
+  -c, --command <CMD>    Action: replace | destroy
+      --replace          Replace share content (shorthand for -c replace)
+      --destroy          Destroy share permanently (shorthand for -c destroy)
+  -p, --password <PW>    Encryption password (required for replace)
+  -t, --type <TYPE>      Content type: txt, pwd, file (must match original)
+      --file             Replace with file content
+
 \x1b[1;4mExamples:\x1b[0m
   nullseal share \"hello world\" -p mypass
   nullseal share \"secret\" -p mypass -T 1h
@@ -41,7 +49,9 @@ mod webrtc;
   nullseal share \"secret\" -p mypass --local
   nullseal share \"secret\" -p mypass --local -a 192.168.1.5
   nullseal get <URL> -p mypass
-  nullseal get -p mypass --local"
+  nullseal get -p mypass --local
+  nullseal manage \"id@secret\" --replace \"new content\" -p mypass
+  nullseal manage \"id@secret\" --destroy"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -100,6 +110,27 @@ enum Commands {
         #[arg(short = 'a', long = "address",
               help = "Direct host:port for local transfer (skip mDNS discovery)")]
         address: Option<String>,
+    },
+    #[command(about = "Replace or destroy a share using an owner code")]
+    Manage {
+        #[arg(help = "Owner code (format: shareId@secret)")]
+        owner_code: String,
+        #[arg(short, long, help = "Encryption password (required for replace)")]
+        password: Option<String>,
+        #[arg(help = "New content (for replace)")]
+        content: Option<String>,
+        // -- action flags --
+        #[arg(short = 'c', long = "command", help = "Action: replace or destroy")]
+        action: Option<String>,
+        #[arg(long, help = "Replace share content (shorthand for -c replace)")]
+        replace: bool,
+        #[arg(long, help = "Destroy share permanently (shorthand for -c destroy)")]
+        destroy: bool,
+        // -- content type --
+        #[arg(short = 't', long = "type", help = "Content type: txt, pwd, file")]
+        content_type: Option<String>,
+        #[arg(long, help = "Replace with file content")]
+        file: bool,
     },
 }
 
@@ -169,6 +200,39 @@ async fn main() {
                 let resolved_mode = if p2p { "p2p" } else { "u" };
                 commands::share::run(content, password, resolved_mode, resolved_content_type, None, ttl, one_time, &mut |s| println!("{s}")).await
             }
+        }
+        Commands::Manage { owner_code, password, content, action, replace, destroy, content_type, file } => {
+            // Resolve action from -c flag or boolean shorthands
+            let resolved_action = if destroy {
+                "destroy".to_string()
+            } else if replace {
+                "replace".to_string()
+            } else if let Some(a) = action {
+                a
+            } else {
+                eprintln!("\x1b[1;31m✗\x1b[0m Missing action. Use --replace or --destroy (or -c replace / -c destroy).");
+                std::process::exit(1);
+            };
+
+            if resolved_action != "replace" && resolved_action != "destroy" {
+                eprintln!("\x1b[1;31m✗\x1b[0m Unknown action: {resolved_action}. Supported: replace, destroy");
+                std::process::exit(1);
+            }
+
+            let password = if resolved_action == "replace" {
+                Some(password.unwrap_or_else(prompt_password))
+            } else {
+                password
+            };
+
+            // Resolve content type
+            let content_type_flag = if file {
+                "file".to_string()
+            } else {
+                content_type.unwrap_or_else(|| "txt".to_string())
+            };
+
+            commands::manage::run(owner_code, resolved_action, content, password, content_type_flag, None, &mut |s| println!("{s}")).await
         }
         Commands::Get { url, password, output, network, local, address } => {
             let password = password.unwrap_or_else(prompt_password);

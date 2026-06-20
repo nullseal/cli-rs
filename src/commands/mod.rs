@@ -1,5 +1,6 @@
 pub mod display;
 pub mod get;
+pub mod manage;
 pub mod share;
 
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[

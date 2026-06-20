@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 
 use crate::api::{ApiClient, P2PVerifyError};
-use crate::crypto::{decrypt_bytes, sha256_hex};
+use crate::crypto::{decrypt_bytes, decrypt_challenge, sha256_hex};
 use crate::local_signal::SignalClient;
 use crate::socket::P2PSocket;
 use crate::webrtc::ReceiverPeer;
@@ -99,7 +99,20 @@ async fn run_server(
     log: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let client = ApiClient::new(server_url(server)?);
-    let payload = client.get_share_payload(share_id).await?;
+
+    // Step 1: fetch metadata (includes encrypted challenge + verifyId)
+    let metadata = client.get_share_metadata(share_id).await?;
+
+    // Step 2: decrypt challenge to prove password knowledge
+    let answer = decrypt_challenge(
+        &metadata.encrypted_challenge,
+        &metadata.challenge_metadata,
+        password,
+    )
+    .map_err(|_| anyhow::anyhow!("Wrong password or corrupted data"))?;
+
+    // Step 3: submit answer to get payload (server auto-consumes one-time shares)
+    let payload = client.get_share_payload(share_id, &answer, &metadata.verify_id).await?;
     log(&format!("Received {}, decrypting…", super::format_size(payload.encrypted_payload.len())));
     let decrypted = decrypt_bytes(&payload.encrypted_payload, &payload.encryption_metadata, password)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -352,7 +365,7 @@ pub async fn run_local(
 mod tests {
     use super::*;
     use std::path::Path;
-    use crate::crypto::encrypt_bytes;
+    use crate::crypto::{encrypt_bytes, generate_challenge};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -406,33 +419,92 @@ mod tests {
 
     // ── server get ───────────────────────────────────────────────────────────
 
-    fn encrypted_payload_for(plaintext: &[u8], password: &str) -> serde_json::Value {
+    /// Helper: mount both metadata and payload mocks for a text share.
+    async fn mount_text_share(server: &MockServer, share_id: &str, plaintext: &[u8], password: &str) {
         let r = encrypt_bytes(plaintext, password);
-        serde_json::json!({
-            "contentType": "text",
-            "encryptedPayload": r.encrypted_payload,
-            "encryptionMetadata": {
-                "algorithm": r.encryption_metadata.algorithm,
-                "kdf": r.encryption_metadata.kdf,
-                "iterations": r.encryption_metadata.iterations,
-                "salt": r.encryption_metadata.salt,
-                "iv": r.encryption_metadata.iv
-            },
-            "fileMetadata": null
-        })
+        let challenge = generate_challenge(password);
+        let verify_id = "v".repeat(32);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/shares/{share_id}/metadata")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "shareId": share_id,
+                "contentType": "text",
+                "oneTimeRead": false,
+                "encryptedChallenge": challenge.encrypted_challenge,
+                "challengeMetadata": {
+                    "salt": challenge.challenge_metadata.salt,
+                    "iv": challenge.challenge_metadata.iv,
+                    "iterations": challenge.challenge_metadata.iterations
+                },
+                "verifyId": verify_id
+            })))
+            .mount(server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/shares/{share_id}/payload")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "contentType": "text",
+                "encryptedPayload": r.encrypted_payload,
+                "encryptionMetadata": {
+                    "algorithm": r.encryption_metadata.algorithm,
+                    "kdf": r.encryption_metadata.kdf,
+                    "iterations": r.encryption_metadata.iterations,
+                    "salt": r.encryption_metadata.salt,
+                    "iv": r.encryption_metadata.iv
+                },
+                "fileMetadata": null
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Helper: mount both metadata and payload mocks for a file share.
+    async fn mount_file_share(server: &MockServer, share_id: &str, content: &[u8], password: &str, filename: &str) {
+        let r = encrypt_bytes(content, password);
+        let challenge = generate_challenge(password);
+        let verify_id = "v".repeat(32);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/shares/{share_id}/metadata")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "shareId": share_id,
+                "contentType": "file",
+                "oneTimeRead": false,
+                "encryptedChallenge": challenge.encrypted_challenge,
+                "challengeMetadata": {
+                    "salt": challenge.challenge_metadata.salt,
+                    "iv": challenge.challenge_metadata.iv,
+                    "iterations": challenge.challenge_metadata.iterations
+                },
+                "verifyId": verify_id
+            })))
+            .mount(server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/shares/{share_id}/payload")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "contentType": "file",
+                "encryptedPayload": r.encrypted_payload,
+                "encryptionMetadata": {
+                    "algorithm": r.encryption_metadata.algorithm,
+                    "kdf": r.encryption_metadata.kdf,
+                    "iterations": r.encryption_metadata.iterations,
+                    "salt": r.encryption_metadata.salt,
+                    "iv": r.encryption_metadata.iv
+                },
+                "fileMetadata": { "filename": filename, "mimeType": "application/octet-stream", "size": content.len(), "extension": ".zip" }
+            })))
+            .mount(server)
+            .await;
     }
 
     #[tokio::test]
     async fn decrypts_and_logs_text() {
         let (server, url) = mock_server().await;
-        Mock::given(method("GET"))
-            .and(path("/shares/abc123/payload"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(encrypted_payload_for(b"top secret", "mypassword")),
-            )
-            .mount(&server)
-            .await;
+        mount_text_share(&server, "abc123", b"top secret", "mypassword").await;
 
         let mut logged = String::new();
         run("https://example.com/s/abc123", "mypassword", None, Some(url), &mut |s| {
@@ -447,14 +519,8 @@ mod tests {
     #[tokio::test]
     async fn wrong_password_errors() {
         let (server, url) = mock_server().await;
-        Mock::given(method("GET"))
-            .and(path("/shares/abc/payload"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .set_body_json(encrypted_payload_for(b"secret", "correctpass")),
-            )
-            .mount(&server)
-            .await;
+        // Encrypt challenge with "correctpass" — client will try "wrongpass" and fail locally
+        mount_text_share(&server, "abc", b"secret", "correctpass").await;
 
         let err = run("https://example.com/s/abc", "wrongpass", None, Some(url), &mut |_| {})
             .await
@@ -471,25 +537,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let password = "filepass";
         let content = b"\x00\x01\x02\x03";
-        let r = encrypt_bytes(content, password);
 
         let (server, url) = mock_server().await;
-        Mock::given(method("GET"))
-            .and(path("/shares/fid/payload"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "contentType": "file",
-                "encryptedPayload": r.encrypted_payload,
-                "encryptionMetadata": {
-                    "algorithm": r.encryption_metadata.algorithm,
-                    "kdf": r.encryption_metadata.kdf,
-                    "iterations": r.encryption_metadata.iterations,
-                    "salt": r.encryption_metadata.salt,
-                    "iv": r.encryption_metadata.iv
-                },
-                "fileMetadata": { "filename": "data.zip", "mimeType": "application/octet-stream", "size": 4, "extension": ".zip" }
-            })))
-            .mount(&server)
-            .await;
+        mount_file_share(&server, "fid", content, password, "data.zip").await;
 
         let dir = tmp.path().to_str().unwrap().to_owned();
         run("https://example.com/s/fid", password, Some(dir.clone()), Some(url), &mut |_| {})
@@ -506,18 +556,8 @@ mod tests {
         std::fs::write(tmp.path().join("data.zip"), b"existing").unwrap();
 
         let password = "filepass";
-        let r = encrypt_bytes(b"\x01", password);
         let (server, url) = mock_server().await;
-        Mock::given(method("GET"))
-            .and(path("/shares/dup/payload"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "contentType": "file",
-                "encryptedPayload": r.encrypted_payload,
-                "encryptionMetadata": { "algorithm": r.encryption_metadata.algorithm, "kdf": r.encryption_metadata.kdf, "iterations": r.encryption_metadata.iterations, "salt": r.encryption_metadata.salt, "iv": r.encryption_metadata.iv },
-                "fileMetadata": { "filename": "data.zip", "mimeType": "application/octet-stream", "size": 1, "extension": ".zip" }
-            })))
-            .mount(&server)
-            .await;
+        mount_file_share(&server, "dup", b"\x01", password, "data.zip").await;
 
         let dir = tmp.path().to_str().unwrap().to_owned();
         let err = run("https://example.com/s/dup", password, Some(dir), Some(url), &mut |_| {})
@@ -528,10 +568,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decrypts_file_and_saves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let password = "pass123";
+        let content = b"file content bytes";
+
+        let (server, url) = mock_server().await;
+        mount_file_share(&server, "file1", content, password, "doc.zip").await;
+
+        let dir = tmp.path().to_str().unwrap().to_owned();
+        run("https://example.com/s/file1", password, Some(dir.clone()), Some(url), &mut |_| {})
+            .await
+            .unwrap();
+
+        let saved = std::fs::read(Path::new(&dir).join("doc.zip")).unwrap();
+        assert_eq!(saved, content);
+    }
+
+    #[tokio::test]
     async fn propagates_share_unavailable() {
         let (server, url) = mock_server().await;
         Mock::given(method("GET"))
-            .and(path("/shares/gone/payload"))
+            .and(path("/shares/gone/metadata"))
             .respond_with(ResponseTemplate::new(404))
             .mount(&server)
             .await;
@@ -649,29 +707,13 @@ mod tests {
     // ── server get: additional cases ─────────────────────────────────────
 
     #[tokio::test]
-    async fn decrypts_file_and_saves() {
+    async fn decrypts_file_and_saves_bare_id() {
         let tmp = tempfile::tempdir().unwrap();
         let password = "testpass";
         let content = b"file content here";
-        let r = encrypt_bytes(content, password);
 
         let (server, url) = mock_server().await;
-        Mock::given(method("GET"))
-            .and(path("/shares/fid2/payload"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "contentType": "file",
-                "encryptedPayload": r.encrypted_payload,
-                "encryptionMetadata": {
-                    "algorithm": r.encryption_metadata.algorithm,
-                    "kdf": r.encryption_metadata.kdf,
-                    "iterations": r.encryption_metadata.iterations,
-                    "salt": r.encryption_metadata.salt,
-                    "iv": r.encryption_metadata.iv
-                },
-                "fileMetadata": { "filename": "test.pdf", "mimeType": "application/pdf", "size": 17, "extension": ".pdf" }
-            })))
-            .mount(&server)
-            .await;
+        mount_file_share(&server, "fid2", content, password, "test.pdf").await;
 
         let dir = tmp.path().to_str().unwrap().to_owned();
         run("s/fid2", password, Some(dir.clone()), Some(url), &mut |_| {})

@@ -136,6 +136,42 @@ nullseal get --local -p hunter2
 nullseal get --local -a 192.168.1.42:5555 -p hunter2
 ```
 
+### Manage
+
+```
+nullseal manage <ownercode> [options]
+```
+
+Replace or destroy an existing share using the owner code returned at creation time.
+
+| Option | Default | Description |
+|---|---|---|
+| `-c, --command` | — | Action: `replace` or `destroy` |
+| `--replace` | — | Replace share content (shorthand for `-c replace`) |
+| `--destroy` | — | Destroy share permanently (shorthand for `-c destroy`) |
+| `-p, --password` | (prompted) | Encryption password (required for replace) |
+| `-t, --type` | `txt` | Content type: `txt`, `pwd`, `file` (must match original) |
+| `--file` | — | Replace with file content |
+
+**Examples**
+
+```bash
+# Replace text content with a new secret
+nullseal manage "shareId@ownerSecret" --replace "new secret" -p hunter2
+
+# Replace using -c flag
+nullseal manage "shareId@ownerSecret" -c replace "updated content" -p hunter2
+
+# Replace a file share with a new file
+nullseal manage "shareId@ownerSecret" --replace ./newfile.pdf --file -p hunter2
+
+# Destroy a share permanently
+nullseal manage "shareId@ownerSecret" --destroy
+
+# Destroy using -c flag
+nullseal manage "shareId@ownerSecret" -c destroy
+```
+
 ---
 
 ## Security
