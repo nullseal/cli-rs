@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use anyhow::{bail, Result};
 
 use crate::api::{ApiClient, P2PVerifyError};
-use crate::crypto::{decrypt_bytes, decrypt_challenge, sha256_hex};
+use crate::crypto::{decrypt_bytes, decrypt_challenge, sha256_bytes, sha256_hex};
 use crate::local_signal::SignalClient;
 use crate::socket::P2PSocket;
 use crate::webrtc::ReceiverPeer;
@@ -116,6 +116,14 @@ async fn run_server(
     log(&format!("Received {}, decrypting…", super::format_size(payload.encrypted_payload.len())));
     let decrypted = decrypt_bytes(&payload.encrypted_payload, &payload.encryption_metadata, password)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let actual_checksum = sha256_bytes(&decrypted);
+    if actual_checksum != payload.content_checksum {
+        eprintln!("\x1b[1;33m⚠\x1b[0m Warning: Content integrity check failed. This share may have been tampered with.");
+        if !metadata.one_time_read {
+            let _ = client.report_malformed(share_id).await;
+        }
+    }
 
     if payload.content_type == "file" {
         if let Some(fm) = &payload.file_metadata {
@@ -238,6 +246,13 @@ async fn run_p2p(
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    if let Some(expected) = &transfer.content_checksum {
+        let actual = sha256_bytes(&decrypted);
+        if actual != *expected {
+            eprintln!("\x1b[1;33m⚠\x1b[0m Warning: Content integrity check failed. This share may have been tampered with.");
+        }
+    }
+
     // 11. Output
     if transfer.content_type == "file" {
         if let Some(fm) = &transfer.file_metadata {
@@ -335,6 +350,13 @@ pub async fn run_local(
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
+    if let Some(expected) = &transfer.content_checksum {
+        let actual = sha256_bytes(&decrypted);
+        if actual != *expected {
+            eprintln!("\x1b[1;33m⚠\x1b[0m Warning: Content integrity check failed. This share may have been tampered with.");
+        }
+    }
+
     // 8. Output
     if transfer.content_type == "file" {
         if let Some(fm) = &transfer.file_metadata {
@@ -365,7 +387,7 @@ pub async fn run_local(
 mod tests {
     use super::*;
     use std::path::Path;
-    use crate::crypto::{encrypt_bytes, generate_challenge};
+    use crate::crypto::{encrypt_bytes, generate_challenge, sha256_bytes};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -424,6 +446,7 @@ mod tests {
         let r = encrypt_bytes(plaintext, password);
         let challenge = generate_challenge(password);
         let verify_id = "v".repeat(32);
+        let checksum = sha256_bytes(plaintext);
 
         Mock::given(method("GET"))
             .and(path(format!("/shares/{share_id}/metadata")))
@@ -437,7 +460,8 @@ mod tests {
                     "iv": challenge.challenge_metadata.iv,
                     "iterations": challenge.challenge_metadata.iterations
                 },
-                "verifyId": verify_id
+                "verifyId": verify_id,
+                "contentChecksum": checksum
             })))
             .mount(server)
             .await;
@@ -454,7 +478,8 @@ mod tests {
                     "salt": r.encryption_metadata.salt,
                     "iv": r.encryption_metadata.iv
                 },
-                "fileMetadata": null
+                "fileMetadata": null,
+                "contentChecksum": checksum
             })))
             .mount(server)
             .await;
@@ -465,6 +490,7 @@ mod tests {
         let r = encrypt_bytes(content, password);
         let challenge = generate_challenge(password);
         let verify_id = "v".repeat(32);
+        let checksum = sha256_bytes(content);
 
         Mock::given(method("GET"))
             .and(path(format!("/shares/{share_id}/metadata")))
@@ -478,7 +504,8 @@ mod tests {
                     "iv": challenge.challenge_metadata.iv,
                     "iterations": challenge.challenge_metadata.iterations
                 },
-                "verifyId": verify_id
+                "verifyId": verify_id,
+                "contentChecksum": checksum
             })))
             .mount(server)
             .await;
@@ -495,7 +522,8 @@ mod tests {
                     "salt": r.encryption_metadata.salt,
                     "iv": r.encryption_metadata.iv
                 },
-                "fileMetadata": { "filename": filename, "mimeType": "application/octet-stream", "size": content.len(), "extension": ".zip" }
+                "fileMetadata": { "filename": filename, "mimeType": "application/octet-stream", "size": content.len(), "extension": ".zip" },
+                "contentChecksum": checksum
             })))
             .mount(server)
             .await;

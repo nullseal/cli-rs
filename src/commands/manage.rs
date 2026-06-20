@@ -83,6 +83,7 @@ pub async fn run(
             let (bytes, file_metadata) = read_content(&content, new_content_type)?;
 
             // Encrypt
+            let content_checksum = crate::crypto::sha256_bytes(&bytes);
             let result = encrypt_bytes(&bytes, &password);
             let challenge = generate_challenge(&password);
 
@@ -100,6 +101,7 @@ pub async fn run(
                         challenge_plaintext: challenge.challenge_plaintext,
                         encrypted_challenge: challenge.encrypted_challenge,
                         challenge_metadata: challenge.challenge_metadata,
+                        content_checksum,
                     },
                 )
                 .await?;

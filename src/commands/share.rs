@@ -135,6 +135,7 @@ pub async fn run_local(
     let ReadInput { bytes, file_metadata } = read_input(&content, content_type)?;
 
     // 1. Encrypt + derive password proof
+    let content_checksum = crate::crypto::sha256_bytes(&bytes);
     let result = encrypt_bytes(&bytes, &password);
     let proof = sha256_hex(&password);
 
@@ -205,6 +206,7 @@ pub async fn run_local(
             .as_ref()
             .map(|fm| serde_json::to_value(fm).unwrap())
             .as_ref(),
+        &content_checksum,
         &|sent, total| {
             eprint!("\rSending: {}/{}\x1b[K", super::format_size(sent), super::format_size(total));
         },
@@ -259,6 +261,7 @@ async fn run_server(
     let client = ApiClient::new(server_url(server.as_deref())?);
     let content_type = resolve_content_type(&content_type_flag);
     let ReadInput { bytes, file_metadata } = read_input(&content, content_type)?;
+    let content_checksum = crate::crypto::sha256_bytes(&bytes);
     let result = encrypt_bytes(&bytes, &password);
     let challenge = generate_challenge(&password);
 
@@ -275,6 +278,7 @@ async fn run_server(
             challenge_plaintext: challenge.challenge_plaintext,
             encrypted_challenge: challenge.encrypted_challenge,
             challenge_metadata: challenge.challenge_metadata,
+            content_checksum,
         })
         .await?;
 
@@ -309,6 +313,7 @@ async fn run_p2p(
     let ReadInput { bytes, file_metadata } = read_input(&content, content_type)?;
 
     // 1. Encrypt + derive password proof
+    let content_checksum = crate::crypto::sha256_bytes(&bytes);
     let result = encrypt_bytes(&bytes, &password);
     let proof = sha256_hex(&password);
 
@@ -414,6 +419,7 @@ async fn run_p2p(
             .as_ref()
             .map(|fm| serde_json::to_value(fm).unwrap())
             .as_ref(),
+        &content_checksum,
         &|sent, total| {
             eprint!("\rSending: {}/{}\x1b[K", super::format_size(sent), super::format_size(total));
         },

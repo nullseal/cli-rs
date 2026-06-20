@@ -54,6 +54,7 @@ pub struct CreateShareRequest {
     pub challenge_plaintext: String,
     pub encrypted_challenge: String,
     pub challenge_metadata: ChallengeMetadata,
+    pub content_checksum: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +74,7 @@ pub struct SharePayloadResponse {
     pub encrypted_payload: String,
     pub encryption_metadata: EncryptionMetadata,
     pub file_metadata: Option<ShareFileMetadata>,
+    pub content_checksum: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,6 +97,7 @@ pub struct ShareMetadataResponse {
     pub encrypted_challenge: String,
     pub challenge_metadata: ChallengeMetadata,
     pub verify_id: String,
+    pub content_checksum: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +123,7 @@ pub struct ReplaceShareRequest {
     pub challenge_plaintext: String,
     pub encrypted_challenge: String,
     pub challenge_metadata: ChallengeMetadata,
+    pub content_checksum: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -400,6 +404,25 @@ impl ApiClient {
         }
         Ok(())
     }
+
+    pub async fn report_malformed(
+        &self,
+        share_id: &str,
+    ) -> Result<(), ApiError> {
+        let resp = self
+            .client
+            .post(self.url(&format!(
+                "/shares/{}/report-malformed",
+                urlencoding::encode(share_id)
+            )))
+            .send()
+            .await?;
+
+        if !resp.status().is_success() {
+            return Err(ApiError::RequestFailed);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -449,6 +472,7 @@ mod tests {
                     iv: "civ".into(),
                     iterations: 250_000,
                 },
+                content_checksum: "a".repeat(64),
             })
             .await
             .unwrap();

@@ -188,8 +188,11 @@ This repository is the only component you need to audit. You can clone it, read 
 | Salt | 16 bytes, random per share |
 | IV | 12 bytes, random per share |
 | Encoding | Standard Base64 (RFC 4648) |
+| Integrity | SHA-256 checksum verified after decryption |
 
 The encryption output is byte-identical to the Web Crypto API, so shares created in the browser and on the CLI are interoperable.
+
+**Content integrity**: Before encryption, the sender computes a SHA-256 checksum of the raw content. After decryption, the receiver recomputes the checksum and compares. If they don't match — due to a malformed share, interrupted transfer, or tampering — the CLI prints a warning and reports the mismatch to the server so the owner can be notified.
 
 For maximum privacy, use `-n local` mode — transfers stay entirely on your local network with no server involved.
 

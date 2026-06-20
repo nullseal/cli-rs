@@ -90,6 +90,11 @@ pub fn sha256_hex(text: &str) -> String {
     format!("{hash:x}")
 }
 
+pub fn sha256_bytes(data: &[u8]) -> String {
+    let hash = Sha256::digest(data);
+    format!("{hash:x}")
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct ChallengeMetadata {
     pub salt: String,
@@ -114,7 +119,8 @@ pub fn generate_challenge(password: &str) -> ChallengeResult {
     rng.fill_bytes(&mut salt);
     rng.fill_bytes(&mut iv);
 
-    let key = derive_key(password, &salt, ITERATIONS);
+    let password_hash = sha256_hex(password);
+    let key = derive_key(&password_hash, &salt, ITERATIONS);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
     let ciphertext = cipher
         .encrypt(Nonce::from_slice(&iv), challenge_plaintext.as_bytes())
@@ -140,7 +146,8 @@ pub fn decrypt_challenge(
     let iv = B64.decode(&metadata.iv).map_err(|_| CryptoError::DecryptFailed)?;
     let ciphertext = B64.decode(encrypted_challenge).map_err(|_| CryptoError::DecryptFailed)?;
 
-    let key = derive_key(password, &salt, metadata.iterations);
+    let password_hash = sha256_hex(password);
+    let key = derive_key(&password_hash, &salt, metadata.iterations);
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
 
     let plaintext = cipher

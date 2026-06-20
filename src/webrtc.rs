@@ -302,6 +302,7 @@ pub struct ReceivedTransfer {
     pub encryption_metadata: EncryptionMetadata,
     pub file_metadata: Option<Value>,
     pub encrypted_payload: String,
+    pub content_checksum: Option<String>,
 }
 
 // ── SenderPeer ────────────────────────────────────────────────────────────────
@@ -380,6 +381,7 @@ impl SenderPeer {
         content_type: &str,
         encryption_metadata: &EncryptionMetadata,
         file_metadata: Option<&Value>,
+        content_checksum: &str,
         on_progress: &dyn Fn(usize, usize),
     ) -> Result<()> {
         let total = encrypted_payload.len();
@@ -389,6 +391,7 @@ impl SenderPeer {
                 "contentType": content_type,
                 "encryptionMetadata": serde_json::to_value(encryption_metadata)?,
                 "fileMetadata": file_metadata,
+                "contentChecksum": content_checksum,
                 "totalSize": total,
             })
             .to_string(),
@@ -477,6 +480,7 @@ impl ReceiverPeer {
         let mut content_type = String::new();
         let mut enc_meta: Option<EncryptionMetadata> = None;
         let mut file_meta: Option<Value> = None;
+        let mut content_checksum: Option<String> = None;
         let mut chunks: Vec<String> = Vec::new();
         let mut total_size: usize = 0;
         let mut received: usize = 0;
@@ -509,6 +513,9 @@ impl ReceiverPeer {
                             } else {
                                 Some(v["fileMetadata"].clone())
                             };
+                            content_checksum = v["contentChecksum"]
+                                .as_str()
+                                .map(|s| s.to_owned());
                             total_size = v["totalSize"].as_u64().unwrap_or(0) as usize;
                         }
                         Some("chunk") => {
@@ -534,6 +541,7 @@ impl ReceiverPeer {
                 .ok_or_else(|| anyhow::anyhow!("no metadata frame received"))?,
             file_metadata: file_meta,
             encrypted_payload: chunks.concat(),
+            content_checksum,
         })
     }
 
