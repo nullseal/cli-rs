@@ -145,7 +145,7 @@ pub struct P2PSession {
     pub expires_at: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
 pub struct IceServer {

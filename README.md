@@ -11,6 +11,7 @@ Encrypted sharing CLI — send secrets, files, and passwords securely from the t
 
 - **End-to-end encryption** — AES-256-GCM with PBKDF2-SHA256 (250 000 iterations). The server never sees plaintext or your password.
 - **Three transfer modes** — short-time upload, WebRTC P2P (relayed signaling, direct data), or fully local (mDNS discovery, no server).
+- **Automatic retry & resume** — P2P transfers retry up to 3 times on ICE/connection failure (backoff 1s/2s/4s). Resumable transfer skips already-delivered chunks using a chunk-index protocol.
 - **Native binary** — single executable, no Node.js runtime required at run time.
 - **Cross-platform** — macOS (arm64, x64), Linux (x64, arm64), Windows (x64).
 - **QR code output** — share URLs print as a QR code for easy phone scanning.

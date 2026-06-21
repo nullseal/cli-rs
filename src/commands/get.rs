@@ -8,7 +8,7 @@ use crate::local_signal::SignalClient;
 use crate::socket::P2PSocket;
 use crate::webrtc::ReceiverPeer;
 
-use super::confirm_unsafe_file;
+use super::{confirm_unsafe_file, prompt_manual_retry};
 
 const MIN_PASSWORD_LEN: usize = 3;
 
@@ -187,97 +187,216 @@ async fn run_p2p(
         .ok_or_else(|| anyhow::anyhow!("socket closed before joined"))?;
     log("Connected. Waiting for sender…");
 
-    // 6. Wait for SDP offer from sender
-    let offer = loop {
-        tokio::select! {
-            biased;
-            o = events.offer.recv() => {
-                if let Some(offer) = o {
-                    break offer;
-                }
-                bail!("socket closed before offer");
-            }
-            err = events.error.recv() => {
-                if let Some(code) = err {
-                    bail!("signaling error: {code}");
-                }
-            }
-        }
-    };
+    // Retry loop for WebRTC connection + transfer
+    const MAX_RETRIES: u32 = 3;
+    const BACKOFF_MS: [u64; 3] = [1000, 2000, 4000];
 
-    // 7. Create WebRTC receiver peer from offer, send answer back
-    let mut receiver = ReceiverPeer::from_offer(offer, ice_servers, None).await?;
-    socket.send_answer(receiver.answer_sdp_json()).await?;
+    const OFFER_TIMEOUT_SECS: u64 = 10;
 
-    // 8. Relay ICE candidates while waiting for DataChannel open
+    let mut attempt = 0u32;
+    let mut last_chunk_index: i64 = -1;
+    let mut all_chunks: Vec<String> = Vec::new();
+
     loop {
-        tokio::select! {
-            biased;
-            event = receiver.next_event() => {
-                match event {
-                    Some(crate::webrtc::LoopEvent::ChannelOpen) => {
-                        log("Transfer started…");
-                        break;
+        // 6. Wait for SDP offer from sender — with timeout during retries
+        let offer_result = if attempt == 0 {
+            // First attempt: wait indefinitely for sender's offer
+            let offer = loop {
+                tokio::select! {
+                    biased;
+                    o = events.offer.recv() => {
+                        if let Some(offer) = o {
+                            break offer;
+                        }
+                        bail!("socket closed before offer");
                     }
-                    Some(crate::webrtc::LoopEvent::Error(e)) => bail!("WebRTC error: {e}"),
-                    Some(crate::webrtc::LoopEvent::Done) | None => bail!("WebRTC closed before transfer"),
-                    _ => {}
+                    err = events.error.recv() => {
+                        if let Some(code) = err {
+                            bail!("signaling error: {code}");
+                        }
+                    }
                 }
-            }
-            ice = events.ice.recv() => {
-                if let Some(c) = ice {
-                    receiver.add_ice_candidate(c)?;
-                }
-            }
-        }
-    }
-
-    // 9. Collect the full transfer (metadata + chunks + end)
-    let transfer = receiver.receive_transfer(&proof, &|received, total| {
-        eprint!("\rReceiving: {}/{}\x1b[K", super::format_size(received), super::format_size(total));
-    }).await?;
-    eprintln!();
-
-    // 10. Decrypt
-    let decrypted = decrypt_bytes(
-        &transfer.encrypted_payload,
-        &transfer.encryption_metadata,
-        password,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    if let Some(expected) = &transfer.content_checksum {
-        let actual = sha256_bytes(&decrypted);
-        if actual != *expected {
-            eprintln!("\x1b[1;33m⚠\x1b[0m Warning: Content integrity check failed. This share may have been tampered with.");
-        }
-    }
-
-    // 11. Output
-    if transfer.content_type == "file" {
-        if let Some(fm) = &transfer.file_metadata {
-            let filename = fm["filename"]
-                .as_str()
-                .unwrap_or("received_file");
-            let dir = output_dir.unwrap_or(".");
-            let filepath = PathBuf::from(dir).join(filename);
-            confirm_unsafe_file(filename)?;
-            if filepath.exists() {
-                bail!("File already exists: {}", filepath.display());
-            }
-            std::fs::write(&filepath, &decrypted)?;
-            log(&format!("Saved: {}", filepath.display()));
+            };
+            Some(offer)
         } else {
-            log(std::str::from_utf8(&decrypted).unwrap_or("(binary data)"));
-        }
-    } else {
-        log(std::str::from_utf8(&decrypted).unwrap_or("(binary data)"));
-    }
+            // Retry: timeout if offer doesn't arrive within 10s
+            let mut got_offer = None;
+            tokio::select! {
+                biased;
+                o = events.offer.recv() => {
+                    if let Some(offer) = o {
+                        got_offer = Some(offer);
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(OFFER_TIMEOUT_SECS)) => {}
+            }
+            got_offer
+        };
 
-    // 12. Cleanup
-    receiver.close();
-    socket.disconnect().await?;
-    Ok(())
+        let offer = match offer_result {
+            Some(o) => o,
+            None => {
+                attempt += 1;
+                if attempt > MAX_RETRIES {
+                    if !prompt_manual_retry().await {
+                        bail!("Sender did not reconnect after {MAX_RETRIES} retries.");
+                    }
+                    attempt = 0;
+                    socket.emit_join(session_id, "recipient")?;
+                    continue;
+                }
+                let delay = BACKOFF_MS.get((attempt - 1) as usize).copied().unwrap_or(4000);
+                eprintln!("\x1b[1;33m⟳\x1b[0m Retrying ({attempt}/{MAX_RETRIES}) — no offer received…");
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                socket.emit_join(session_id, "recipient")?;
+                continue;
+            }
+        };
+
+        // 7. Create WebRTC receiver peer from offer, send answer back
+        let mut receiver = ReceiverPeer::from_offer(offer, ice_servers.clone(), None).await?;
+        socket.send_answer(receiver.answer_sdp_json()).await?;
+
+        // 8. Relay ICE candidates while waiting for DataChannel open (10s timeout)
+        let channel_open;
+        let channel_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async {
+                loop {
+                    tokio::select! {
+                        biased;
+                        event = receiver.next_event() => {
+                            match event {
+                                Some(crate::webrtc::LoopEvent::ChannelOpen) => return Ok::<bool, anyhow::Error>(true),
+                                Some(crate::webrtc::LoopEvent::Error(e)) => {
+                                    eprintln!("\x1b[1;33m⚠\x1b[0m WebRTC error: {e}");
+                                    return Ok(false);
+                                }
+                                Some(crate::webrtc::LoopEvent::Done) | None => return Ok(false),
+                                _ => {}
+                            }
+                        }
+                        ice = events.ice.recv() => {
+                            if let Some(c) = ice {
+                                receiver.add_ice_candidate(c)?;
+                            }
+                        }
+                    }
+                }
+            },
+        )
+        .await;
+        channel_open = matches!(channel_result, Ok(Ok(true)));
+
+        if !channel_open {
+            attempt += 1;
+            if attempt > MAX_RETRIES {
+                if !prompt_manual_retry().await {
+                    bail!("WebRTC connection failed after {MAX_RETRIES} retries.");
+                }
+                attempt = 0;
+                socket.emit_join(session_id, "recipient")?;
+                continue;
+            }
+            let delay = BACKOFF_MS.get((attempt - 1) as usize).copied().unwrap_or(4000);
+            eprintln!("\x1b[1;33m⟳\x1b[0m Retrying ({attempt}/{MAX_RETRIES})…");
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            socket.emit_join(session_id, "recipient")?;
+            continue;
+        }
+
+        // Reset retry counter on successful connection
+        attempt = 0;
+
+        log("Transfer started…");
+
+        // 9. Send resume frame to sender
+        receiver.send_resume(last_chunk_index)?;
+
+        // 10. Collect the full transfer (metadata + chunks + end)
+        let mut round_chunks: Vec<String> = Vec::new();
+        let prior_bytes: usize = all_chunks.iter().map(|c| c.len()).sum();
+        let transfer_result = receiver.receive_transfer(&proof, &|received, total| {
+            let effective = prior_bytes + received;
+            eprint!("\rReceiving: {}/{}\x1b[K", super::format_size(effective), super::format_size(total));
+        }, &mut round_chunks).await;
+
+        match transfer_result {
+            Ok(transfer) => {
+                eprintln!();
+
+                // Build full payload from prior rounds + this round
+                let full_payload = if all_chunks.is_empty() {
+                    transfer.encrypted_payload
+                } else {
+                    let prior: String = all_chunks.concat();
+                    format!("{}{}", prior, transfer.encrypted_payload)
+                };
+
+                // 11. Decrypt
+                let decrypted = decrypt_bytes(
+                    &full_payload,
+                    &transfer.encryption_metadata,
+                    password,
+                )
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+                if let Some(expected) = &transfer.content_checksum {
+                    let actual = sha256_bytes(&decrypted);
+                    if actual != *expected {
+                        eprintln!("\x1b[1;33m⚠\x1b[0m Warning: Content integrity check failed. This share may have been tampered with.");
+                    }
+                }
+
+                // 12. Output
+                if transfer.content_type == "file" {
+                    if let Some(fm) = &transfer.file_metadata {
+                        let filename = fm["filename"]
+                            .as_str()
+                            .unwrap_or("received_file");
+                        let dir = output_dir.unwrap_or(".");
+                        let filepath = PathBuf::from(dir).join(filename);
+                        confirm_unsafe_file(filename)?;
+                        if filepath.exists() {
+                            bail!("File already exists: {}", filepath.display());
+                        }
+                        std::fs::write(&filepath, &decrypted)?;
+                        log(&format!("Saved: {}", filepath.display()));
+                    } else {
+                        log(std::str::from_utf8(&decrypted).unwrap_or("(binary data)"));
+                    }
+                } else {
+                    log(std::str::from_utf8(&decrypted).unwrap_or("(binary data)"));
+                }
+
+                // 13. Cleanup
+                receiver.close();
+                socket.disconnect().await?;
+                return Ok(());
+            }
+            Err(e) => {
+                // Save partial chunks for resume on next attempt
+                last_chunk_index += round_chunks.len() as i64;
+                all_chunks.extend(round_chunks);
+
+                // Transfer interrupted — retry if possible
+                attempt += 1;
+                if attempt > MAX_RETRIES {
+                    if !prompt_manual_retry().await {
+                        bail!("Transfer failed after {MAX_RETRIES} retries: {e}");
+                    }
+                    attempt = 0;
+                    socket.emit_join(session_id, "recipient")?;
+                    continue;
+                }
+                let delay = BACKOFF_MS.get((attempt - 1) as usize).copied().unwrap_or(4000);
+                eprintln!("\n\x1b[1;33m⟳\x1b[0m Transfer interrupted: {e}. Retrying ({attempt}/{MAX_RETRIES})…");
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                socket.emit_join(session_id, "recipient")?;
+                continue;
+            }
+        }
+    }
 }
 
 // ── Local mode (no server) ────────────────────────────────────────────────────
@@ -337,9 +456,10 @@ pub async fn run_local(
     }
 
     // 6. Receive transfer (verify + metadata + chunks + end)
+    let mut chunks: Vec<String> = Vec::new();
     let transfer = receiver.receive_transfer(&proof, &|received, total| {
         eprint!("\rReceiving: {}/{}\x1b[K", super::format_size(received), super::format_size(total));
-    }).await?;
+    }, &mut chunks).await?;
     eprintln!();
 
     // 7. Decrypt

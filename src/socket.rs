@@ -192,6 +192,12 @@ impl P2PSocket {
         Ok(())
     }
 
+    /// Emit p2p:join with the given session and role.
+    pub fn emit_join(&self, session_id: &str, role: &str) -> Result<()> {
+        self.tx.send(encode_event("p2p:join", &json!({ "sessionId": session_id, "role": role })))?;
+        Ok(())
+    }
+
     pub async fn disconnect(&self) -> Result<()> {
         let _ = self.tx.send("41/p2p,".to_owned());
         Ok(())

@@ -409,6 +409,78 @@ impl SenderPeer {
         Ok(())
     }
 
+    /// Wait for resume frame from receiver, returns the chunk index to start from.
+    /// If no resume frame received within timeout, returns 0.
+    pub async fn wait_for_resume(&mut self, timeout_ms: u64) -> usize {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        loop {
+            tokio::select! {
+                biased;
+                event = self.event_rx.recv() => {
+                    match event {
+                        Some(LoopEvent::Message(text)) => {
+                            if let Ok(v) = serde_json::from_str::<Value>(&text) {
+                                if v["type"].as_str() == Some("resume") {
+                                    let idx = v["chunkIndex"].as_i64().unwrap_or(-1);
+                                    return if idx < 0 { 0 } else { (idx as usize) + 1 };
+                                }
+                            }
+                        }
+                        Some(LoopEvent::Error(e)) => {
+                            eprintln!("\x1b[1;33m⚠\x1b[0m Resume wait error: {e}");
+                            return 0;
+                        }
+                        Some(LoopEvent::Done) | None => return 0,
+                        _ => {}
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    return 0;
+                }
+            }
+        }
+    }
+
+    /// Send transfer starting from a specific chunk index (for resume support).
+    pub fn send_transfer_from(
+        &self,
+        encrypted_payload: &str,
+        content_type: &str,
+        encryption_metadata: &EncryptionMetadata,
+        file_metadata: Option<&Value>,
+        content_checksum: &str,
+        start_chunk: usize,
+        on_progress: &dyn Fn(usize, usize),
+    ) -> Result<()> {
+        let total = encrypted_payload.len();
+        self.send_frame(
+            json!({
+                "type": "metadata",
+                "contentType": content_type,
+                "encryptionMetadata": serde_json::to_value(encryption_metadata)?,
+                "fileMetadata": file_metadata,
+                "contentChecksum": content_checksum,
+                "totalSize": total,
+                "resumeFromChunk": start_chunk,
+            })
+            .to_string(),
+        )?;
+
+        let chunks: Vec<&[u8]> = encrypted_payload.as_bytes().chunks(CHUNK_SIZE).collect();
+        let mut sent = start_chunk * CHUNK_SIZE;
+        on_progress(sent.min(total), total);
+
+        for chunk in chunks.iter().skip(start_chunk) {
+            let data = std::str::from_utf8(chunk).unwrap_or_default();
+            self.send_frame(json!({ "type": "chunk", "data": data }).to_string())?;
+            sent += chunk.len();
+            on_progress(sent.min(total), total);
+        }
+
+        self.send_frame(json!({ "type": "end" }).to_string())?;
+        Ok(())
+    }
+
     pub fn close(&self) {
         let _ = self.cmd_tx.send(LoopCmd::Close);
     }
@@ -472,16 +544,23 @@ impl ReceiverPeer {
         self.event_rx.recv().await
     }
 
+    /// Send resume frame to sender indicating last received chunk index.
+    pub fn send_resume(&self, last_chunk_index: i64) -> Result<()> {
+        self.cmd_tx
+            .send(LoopCmd::SendData(json!({ "type": "resume", "chunkIndex": last_chunk_index }).to_string()))
+            .map_err(|_| anyhow::anyhow!("event loop closed"))
+    }
+
     pub async fn receive_transfer(
         &mut self,
         expected_proof: &str,
         on_progress: &dyn Fn(usize, usize),
+        external_chunks: &mut Vec<String>,
     ) -> Result<ReceivedTransfer> {
         let mut content_type = String::new();
         let mut enc_meta: Option<EncryptionMetadata> = None;
         let mut file_meta: Option<Value> = None;
         let mut content_checksum: Option<String> = None;
-        let mut chunks: Vec<String> = Vec::new();
         let mut total_size: usize = 0;
         let mut received: usize = 0;
         let mut _verified = false;
@@ -521,7 +600,7 @@ impl ReceiverPeer {
                         Some("chunk") => {
                             if let Some(data) = v["data"].as_str() {
                                 received += data.len();
-                                chunks.push(data.to_owned());
+                                external_chunks.push(data.to_owned());
                                 on_progress(received, total_size);
                             }
                         }
@@ -540,7 +619,7 @@ impl ReceiverPeer {
             encryption_metadata: enc_meta
                 .ok_or_else(|| anyhow::anyhow!("no metadata frame received"))?,
             file_metadata: file_meta,
-            encrypted_payload: chunks.concat(),
+            encrypted_payload: external_chunks.concat(),
             content_checksum,
         })
     }
@@ -637,5 +716,135 @@ mod tests {
         let (_socket, addr) = bind_udp(Some(ip)).await.unwrap();
         assert_eq!(addr.ip(), ip);
         assert!(addr.port() > 0);
+    }
+
+    // ── Helper: create a mock SenderPeer that captures frames ────────────
+
+    fn mock_sender_peer() -> (SenderPeer, mpsc::UnboundedReceiver<LoopCmd>, mpsc::UnboundedSender<LoopEvent>) {
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let loop_handle = tokio::spawn(async {});
+        let peer = SenderPeer {
+            cmd_tx,
+            event_rx,
+            offer_sdp: String::new(),
+            loop_handle,
+        };
+        (peer, cmd_rx, event_tx)
+    }
+
+    // ── send_transfer_from includes resumeFromChunk in metadata ──────────
+
+    fn test_enc_meta() -> EncryptionMetadata {
+        EncryptionMetadata {
+            algorithm: "aes-256-gcm".to_string(),
+            kdf: "pbkdf2".to_string(),
+            iterations: 100_000,
+            salt: "salt".to_string(),
+            iv: "iv".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transfer_from_metadata_includes_resume_from_chunk() {
+        let (peer, mut cmd_rx, _event_tx) = mock_sender_peer();
+        let enc_meta = test_enc_meta();
+        peer.send_transfer_from(
+            "hello",
+            "text",
+            &enc_meta,
+            None,
+            "checksum",
+            5,
+            &|_, _| {},
+        )
+        .unwrap();
+
+        // First frame should be metadata
+        if let Some(LoopCmd::SendData(frame)) = cmd_rx.recv().await {
+            let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(v["type"], "metadata");
+            assert_eq!(v["resumeFromChunk"], 5);
+            assert_eq!(v["totalSize"], 5);
+            assert_eq!(v["contentType"], "text");
+        } else {
+            panic!("expected SendData command");
+        }
+    }
+
+    #[tokio::test]
+    async fn send_transfer_from_with_start_0_has_resume_from_chunk_0() {
+        let (peer, mut cmd_rx, _event_tx) = mock_sender_peer();
+        let enc_meta = test_enc_meta();
+        peer.send_transfer_from("ab", "text", &enc_meta, None, "c", 0, &|_, _| {})
+            .unwrap();
+
+        if let Some(LoopCmd::SendData(frame)) = cmd_rx.recv().await {
+            let v: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            assert_eq!(v["resumeFromChunk"], 0);
+        } else {
+            panic!("expected SendData command");
+        }
+    }
+
+    // ── wait_for_resume returns 0 on timeout ─────────────────────────────
+
+    #[tokio::test]
+    async fn wait_for_resume_returns_0_on_timeout() {
+        let (_peer, _cmd_rx, _event_tx) = mock_sender_peer();
+        // Reconstruct with the event_rx we can control
+        let (cmd_tx, _cmd_rx2) = mpsc::unbounded_channel();
+        let (_event_tx2, event_rx) = mpsc::unbounded_channel::<LoopEvent>();
+        let loop_handle = tokio::spawn(async {});
+        let mut peer = SenderPeer {
+            cmd_tx,
+            event_rx,
+            offer_sdp: String::new(),
+            loop_handle,
+        };
+        // No events sent — should timeout and return 0
+        let start = std::time::Instant::now();
+        let result = peer.wait_for_resume(100).await;
+        let elapsed = start.elapsed().as_millis();
+        assert_eq!(result, 0);
+        assert!(elapsed >= 90, "should have waited ~100ms, got {elapsed}ms");
+    }
+
+    #[tokio::test]
+    async fn wait_for_resume_returns_chunk_index_plus_1() {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let loop_handle = tokio::spawn(async {});
+        let mut peer = SenderPeer {
+            cmd_tx,
+            event_rx,
+            offer_sdp: String::new(),
+            loop_handle,
+        };
+        // Send a resume frame
+        event_tx
+            .send(LoopEvent::Message(
+                serde_json::json!({"type": "resume", "chunkIndex": 7}).to_string(),
+            ))
+            .unwrap();
+        let result = peer.wait_for_resume(2000).await;
+        assert_eq!(result, 8); // chunkIndex 7 → start from 8
+    }
+
+    #[tokio::test]
+    async fn wait_for_resume_returns_0_on_channel_close() {
+        let (cmd_tx, _cmd_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let loop_handle = tokio::spawn(async {});
+        let mut peer = SenderPeer {
+            cmd_tx,
+            event_rx,
+            offer_sdp: String::new(),
+            loop_handle,
+        };
+        // Send Done to simulate channel close
+        event_tx.send(LoopEvent::Done).unwrap();
+        let result = peer.wait_for_resume(2000).await;
+        assert_eq!(result, 0);
     }
 }

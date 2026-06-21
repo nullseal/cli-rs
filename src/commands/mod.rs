@@ -57,6 +57,25 @@ pub fn confirm_unsafe_file(filename: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Prompt user to manually retry after auto-retries are exhausted.
+/// Returns `true` if user wants to retry, `false` to abort.
+/// In non-interactive mode (piped stdin), returns `false`.
+pub async fn prompt_manual_retry() -> bool {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return false;
+    }
+    eprintln!("\x1b[1;33m\u{26a0}\x1b[0m All automatic retries exhausted.");
+    eprint!("Press Enter to retry or Ctrl+C to quit\u{2026} ");
+    let mut buf = String::new();
+    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+    use tokio::io::AsyncBufReadExt;
+    match reader.read_line(&mut buf).await {
+        Ok(0) | Err(_) => false,
+        Ok(_) => true,
+    }
+}
+
 pub fn format_size(bytes: usize) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = KB * 1024.0;
