@@ -135,9 +135,13 @@ pub async fn run_local(
     let ReadInput { bytes, file_metadata } = read_input(&content, content_type)?;
 
     // 1. Encrypt + derive password proof
+    let spinner = super::display::Spinner::start(
+        &format!("Encrypting {} …", super::format_size(bytes.len())),
+    );
     let content_checksum = crate::crypto::sha256_bytes(&bytes);
     let result = encrypt_bytes(&bytes, &password);
     let proof = sha256_hex(&password);
+    drop(spinner);
 
     // 2. Parse bind address and bind TCP signaling server
     let (local_ip, explicit_port) = match &bind_addr {
@@ -186,14 +190,25 @@ pub async fn run_local(
         _ => bail!("expected answer, got: {}", msg["type"]),
     }
 
-    // 8. Wait for DataChannel open
-    loop {
-        match sender.next_event().await {
-            Some(crate::webrtc::LoopEvent::ChannelOpen) => break,
-            Some(crate::webrtc::LoopEvent::Error(e)) => bail!("WebRTC error: {e}"),
-            None => bail!("WebRTC closed before channel open"),
-            _ => {}
-        }
+    // 8. Wait for DataChannel open (with timeout)
+    let channel_open = tokio::time::timeout(
+        std::time::Duration::from_secs(crate::retry::CHANNEL_TIMEOUT_SECS),
+        async {
+            loop {
+                match sender.next_event().await {
+                    Some(crate::webrtc::LoopEvent::ChannelOpen) => return Ok::<bool, anyhow::Error>(true),
+                    Some(crate::webrtc::LoopEvent::Error(e)) => bail!("WebRTC error: {e}"),
+                    None => bail!("WebRTC closed before channel open"),
+                    _ => {}
+                }
+            }
+        },
+    )
+    .await;
+    match channel_open {
+        Ok(Ok(true)) => {}
+        Ok(Err(e)) => return Err(e),
+        _ => bail!("DataChannel open timed out"),
     }
 
     // 9. Send transfer
@@ -210,7 +225,7 @@ pub async fn run_local(
         &|sent, total| {
             eprint!("\rSending: {}/{}\x1b[K", super::format_size(sent), super::format_size(total));
         },
-    )?;
+    ).await?;
     eprintln!();
     eprintln!("\x1b[1;32m✓\x1b[0m Transfer complete.");
 
@@ -261,9 +276,13 @@ async fn run_server(
     let client = ApiClient::new(server_url(server.as_deref())?);
     let content_type = resolve_content_type(&content_type_flag);
     let ReadInput { bytes, file_metadata } = read_input(&content, content_type)?;
+    let spinner = super::display::Spinner::start(
+        &format!("Encrypting {} …", super::format_size(bytes.len())),
+    );
     let content_checksum = crate::crypto::sha256_bytes(&bytes);
     let result = encrypt_bytes(&bytes, &password);
     let challenge = generate_challenge(&password);
+    drop(spinner);
 
     let total = result.encrypted_payload.len();
     output(&format!("Uploading {} bytes…", total));
@@ -313,9 +332,13 @@ async fn run_p2p(
     let ReadInput { bytes, file_metadata } = read_input(&content, content_type)?;
 
     // 1. Encrypt + derive password proof
+    let spinner = super::display::Spinner::start(
+        &format!("Encrypting {} …", super::format_size(bytes.len())),
+    );
     let content_checksum = crate::crypto::sha256_bytes(&bytes);
     let result = encrypt_bytes(&bytes, &password);
     let proof = sha256_hex(&password);
+    drop(spinner);
 
     // 2. Create P2P session on the server
     let session = client.create_p2p_session(&proof).await?;
@@ -338,7 +361,7 @@ async fn run_p2p(
     // 4. Connect socket as sender
     let (socket, mut events) = P2PSocket::connect(&base, &session.session_id, "sender").await?;
 
-    // 5. Wait for joined ack (also watch for errors)
+    // 5. Wait for joined ack
     tokio::select! {
         biased;
         j = events.joined.recv() => {
@@ -349,142 +372,56 @@ async fn run_p2p(
         }
     }
 
-    // Retry loop for WebRTC connection
-    const MAX_RETRIES: u32 = 3;
-    const BACKOFF_MS: [u64; 3] = [1000, 2000, 4000];
-    const RESUME_WAIT_MS: u64 = 2000;
-
-    const READY_TIMEOUT_SECS: u64 = 10;
-
+    // 6. Retry loop for WebRTC connection + transfer
+    let policy = &crate::retry::DEFAULT;
     let mut attempt = 0u32;
     loop {
-        // 6. Wait for ready (recipient has joined) — with timeout during retries
-        let got_ready = if attempt == 0 {
-            // First attempt: wait indefinitely for recipient (they haven't joined yet)
-            tokio::select! {
-                biased;
-                r = events.ready.recv() => {
-                    r.ok_or_else(|| anyhow::anyhow!("socket closed before ready — session may have expired"))?;
-                    true
-                }
-                err = events.error.recv() => {
-                    bail!("signaling error while waiting for recipient: {}", err.unwrap_or_else(|| "unknown".into()));
-                }
-            }
-        } else {
-            // Retry: timeout if p2p:ready doesn't arrive within 10s
-            tokio::select! {
-                biased;
-                r = events.ready.recv() => {
-                    r.ok_or_else(|| anyhow::anyhow!("socket closed before ready"))?;
-                    true
-                }
-                err = events.error.recv() => {
-                    bail!("signaling error: {}", err.unwrap_or_else(|| "unknown".into()));
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(READY_TIMEOUT_SECS)) => {
-                    false
-                }
-            }
-        };
+        // 6a. Wait for ready (recipient has joined)
+        let got_ready = super::p2p_stages::await_ready(&mut events, attempt == 0).await?;
 
         if !got_ready {
             attempt += 1;
-            if attempt > MAX_RETRIES {
-                if !super::prompt_manual_retry().await {
-                    bail!("Recipient did not rejoin after {MAX_RETRIES} retries.");
+            if policy.exhausted(attempt) {
+                if !crate::retry::prompt_manual().await {
+                    bail!("Recipient did not rejoin after {} retries.", policy.max_retries);
                 }
                 attempt = 0;
                 socket.emit_join(&session.session_id, "sender")?;
                 continue;
             }
-            let delay = BACKOFF_MS.get((attempt - 1) as usize).copied().unwrap_or(4000);
-            eprintln!("\x1b[1;33m⟳\x1b[0m Retrying ({attempt}/{MAX_RETRIES}) — recipient not ready…");
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            crate::retry::log_retry(attempt, policy.max_retries, "recipient not ready…");
+            tokio::time::sleep(policy.delay(attempt)).await;
             socket.emit_join(&session.session_id, "sender")?;
             continue;
         }
-        eprintln!("\x1b[1;32m✓\x1b[0m Recipient connected. Starting transfer…");
+        super::display::status("Recipient connected. Starting transfer…");
 
         // 7. Create WebRTC sender peer + offer
+        // Drain stale signaling events from previous rounds
+        while events.answer.try_recv().is_ok() {}
+        while events.ice.try_recv().is_ok() {}
+
         let mut sender = SenderPeer::new(ice_servers.clone(), None).await?;
         socket.send_offer(sender.offer_sdp_json()).await?;
 
-        // 8. Wait for answer + relay ICE candidates concurrently
-        let mut got_answer = false;
-        loop {
-            tokio::select! {
-                biased;
-                answer = events.answer.recv() => {
-                    if let Some(sdp) = answer {
-                        sender.handle_answer(sdp)?;
-                        got_answer = true;
-                        break;
-                    }
-                    bail!("socket closed before answer");
-                }
-                ice = events.ice.recv() => {
-                    if let Some(c) = ice {
-                        sender.add_ice_candidate(c)?;
-                    }
-                }
-                err = events.error.recv() => {
-                    if let Some(code) = err {
-                        bail!("signaling error: {code}");
-                    }
-                }
-            }
-        }
+        // 8. Wait for answer + relay ICE candidates
+        super::p2p_stages::await_answer(&sender, &mut events).await?;
 
-        if !got_answer {
-            bail!("did not receive answer");
-        }
-
-        // 9. Continue relaying ICE candidates and wait for DataChannel open (10s timeout)
-        let channel_open;
-        let channel_result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            async {
-                loop {
-                    tokio::select! {
-                        biased;
-                        event = sender.next_event() => {
-                            match event {
-                                Some(crate::webrtc::LoopEvent::ChannelOpen) => return Ok::<bool, anyhow::Error>(true),
-                                Some(crate::webrtc::LoopEvent::Error(e)) => {
-                                    eprintln!("\x1b[1;33m⚠\x1b[0m WebRTC error: {e}");
-                                    return Ok(false);
-                                }
-                                None => return Ok(false),
-                                _ => {}
-                            }
-                        }
-                        ice = events.ice.recv() => {
-                            if let Some(c) = ice {
-                                sender.add_ice_candidate(c)?;
-                            }
-                        }
-                    }
-                }
-            },
-        )
-        .await;
-        channel_open = matches!(channel_result, Ok(Ok(true)));
+        // 9. Wait for DataChannel open
+        let channel_open = super::p2p_stages::await_sender_channel(&mut sender, &mut events).await?;
 
         if !channel_open {
             attempt += 1;
-            if attempt > MAX_RETRIES {
-                if !super::prompt_manual_retry().await {
-                    bail!("WebRTC connection failed after {MAX_RETRIES} retries.");
+            if policy.exhausted(attempt) {
+                if !crate::retry::prompt_manual().await {
+                    bail!("WebRTC connection failed after {} retries.", policy.max_retries);
                 }
                 attempt = 0;
                 socket.emit_join(&session.session_id, "sender")?;
                 continue;
             }
-            let delay = BACKOFF_MS.get((attempt - 1) as usize).copied().unwrap_or(4000);
-            eprintln!("\x1b[1;33m⟳\x1b[0m Retrying ({attempt}/{MAX_RETRIES})…");
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            // Re-join to trigger new signaling round
+            crate::retry::log_retry(attempt, policy.max_retries, "channel open failed…");
+            tokio::time::sleep(policy.delay(attempt)).await;
             socket.emit_join(&session.session_id, "sender")?;
             continue;
         }
@@ -493,14 +430,14 @@ async fn run_p2p(
         attempt = 0;
 
         // 10. Wait for resume frame from receiver
-        let start_chunk = sender.wait_for_resume(RESUME_WAIT_MS).await;
+        let start_chunk = sender.wait_for_resume(crate::retry::RESUME_WAIT_MS).await;
         if start_chunk > 0 {
             eprintln!("\x1b[1;34m↻\x1b[0m Resuming from chunk {start_chunk}");
         }
 
         // 11. Send encrypted transfer over DataChannel
         sender.send_verify(&proof)?;
-        sender.send_transfer_from(
+        let send_result = sender.send_transfer_from(
             &result.encrypted_payload,
             content_type,
             &result.encryption_metadata,
@@ -511,11 +448,30 @@ async fn run_p2p(
             &content_checksum,
             start_chunk,
             &|sent, total| {
-                eprint!("\rSending: {}/{}\x1b[K", super::format_size(sent), super::format_size(total));
+                super::display::transfer_progress(sent, total);
             },
-        )?;
+        ).await;
+
+        if let Err(e) = send_result {
+            eprintln!();
+            sender.close();
+            sender.wait_closed().await;
+            attempt += 1;
+            if policy.exhausted(attempt) {
+                if !crate::retry::prompt_manual().await {
+                    bail!("Transfer failed after {} retries: {e}", policy.max_retries);
+                }
+                attempt = 0;
+            } else {
+                crate::retry::log_retry(attempt, policy.max_retries, &format!("transfer interrupted: {e}"));
+                tokio::time::sleep(policy.delay(attempt)).await;
+            }
+            socket.emit_join(&session.session_id, "sender")?;
+            continue;
+        }
+
         eprintln!();
-        eprintln!("\x1b[1;32m✓\x1b[0m Transfer complete.");
+        super::display::status("Transfer complete.");
 
         // 12. Signal done + cleanup
         socket.done().await?;

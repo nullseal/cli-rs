@@ -1,6 +1,7 @@
 pub mod display;
 pub mod get;
 pub mod manage;
+pub mod p2p_stages;
 pub mod share;
 
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
@@ -57,23 +58,21 @@ pub fn confirm_unsafe_file(filename: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Prompt user to manually retry after auto-retries are exhausted.
-/// Returns `true` if user wants to retry, `false` to abort.
-/// In non-interactive mode (piped stdin), returns `false`.
-pub async fn prompt_manual_retry() -> bool {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
-        return false;
+/// If `path` already exists, append (1), (2), … before the extension until unique.
+pub fn deduplicate_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    if !path.exists() {
+        return path;
     }
-    eprintln!("\x1b[1;33m\u{26a0}\x1b[0m All automatic retries exhausted.");
-    eprint!("Press Enter to retry or Ctrl+C to quit\u{2026} ");
-    let mut buf = String::new();
-    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
-    use tokio::io::AsyncBufReadExt;
-    match reader.read_line(&mut buf).await {
-        Ok(0) | Err(_) => false,
-        Ok(_) => true,
+    let stem = path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+    let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
+    let parent = path.parent().unwrap_or(std::path::Path::new("."));
+    for i in 1..1000 {
+        let candidate = parent.join(format!("{stem} ({i}){ext}"));
+        if !candidate.exists() {
+            return candidate;
+        }
     }
+    path
 }
 
 pub fn format_size(bytes: usize) -> String {

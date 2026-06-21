@@ -151,6 +151,76 @@ fn print_qr(url: &str) {
     }
 }
 
+// ── Semantic status helpers ───────────────────────────────────────────────────
+
+/// Print a success status message.
+pub fn status(msg: &str) {
+    eprintln!("\x1b[1;32m✓\x1b[0m {msg}");
+}
+
+/// Print a warning message.
+pub fn warn(msg: &str) {
+    eprintln!("\x1b[1;33m⚠\x1b[0m {msg}");
+}
+
+/// Print inline transfer progress (overwrites current line).
+pub fn transfer_progress(sent: usize, total: usize) {
+    eprint!(
+        "\rSending: {}/{}\x1b[K",
+        super::format_size(sent),
+        super::format_size(total)
+    );
+}
+
+/// Print inline receive progress (overwrites current line).
+pub fn receive_progress(received: usize, total: usize) {
+    eprint!(
+        "\rReceiving: {}/{}\x1b[K",
+        super::format_size(received),
+        super::format_size(total)
+    );
+}
+
+/// A spinner that runs on a background thread, showing a message with animation.
+/// Stops and clears the line when dropped.
+pub struct Spinner {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    /// Start a spinner with the given message. The spinner runs until dropped.
+    pub fn start(msg: &str) -> Self {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop_clone = stop.clone();
+        let msg = msg.to_owned();
+        let handle = std::thread::spawn(move || {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut i = 0;
+            while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                eprint!("\r\x1b[1;36m{}\x1b[0m {}\x1b[K", frames[i % frames.len()], msg);
+                i += 1;
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            eprint!("\r\x1b[K");
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

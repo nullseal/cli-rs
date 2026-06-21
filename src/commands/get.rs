@@ -8,7 +8,7 @@ use crate::local_signal::SignalClient;
 use crate::socket::P2PSocket;
 use crate::webrtc::ReceiverPeer;
 
-use super::{confirm_unsafe_file, prompt_manual_retry};
+use super::confirm_unsafe_file;
 
 const MIN_PASSWORD_LEN: usize = 3;
 
@@ -113,9 +113,12 @@ async fn run_server(
 
     // Step 3: submit answer to get payload (server auto-consumes one-time shares)
     let payload = client.get_share_payload(share_id, &answer, &metadata.verify_id).await?;
-    log(&format!("Received {}, decrypting…", super::format_size(payload.encrypted_payload.len())));
+    super::display::status(&format!("Received {}", super::format_size(payload.encrypted_payload.len())));
+    let spinner = super::display::Spinner::start("Decrypting…");
     let decrypted = decrypt_bytes(&payload.encrypted_payload, &payload.encryption_metadata, password)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
+    drop(spinner);
+    super::display::status("Decrypted successfully");
 
     let actual_checksum = sha256_bytes(&decrypted);
     if actual_checksum != payload.content_checksum {
@@ -128,11 +131,8 @@ async fn run_server(
     if payload.content_type == "file" {
         if let Some(fm) = &payload.file_metadata {
             let dir = output_dir.unwrap_or(".");
-            let filepath = PathBuf::from(dir).join(&fm.filename);
+            let filepath = super::deduplicate_path(PathBuf::from(dir).join(&fm.filename));
             confirm_unsafe_file(&fm.filename)?;
-            if filepath.exists() {
-                bail!("File already exists: {}", filepath.display());
-            }
             std::fs::write(&filepath, &decrypted)?;
             log(&format!("Saved: {}", filepath.display()));
             return Ok(());
@@ -187,67 +187,34 @@ async fn run_p2p(
         .ok_or_else(|| anyhow::anyhow!("socket closed before joined"))?;
     log("Connected. Waiting for sender…");
 
-    // Retry loop for WebRTC connection + transfer
-    const MAX_RETRIES: u32 = 3;
-    const BACKOFF_MS: [u64; 3] = [1000, 2000, 4000];
-
-    const OFFER_TIMEOUT_SECS: u64 = 10;
-
+    // 6. Retry loop for WebRTC connection + transfer
+    let policy = &crate::retry::DEFAULT;
     let mut attempt = 0u32;
     let mut last_chunk_index: i64 = -1;
     let mut all_chunks: Vec<String> = Vec::new();
 
     loop {
-        // 6. Wait for SDP offer from sender — with timeout during retries
-        let offer_result = if attempt == 0 {
-            // First attempt: wait indefinitely for sender's offer
-            let offer = loop {
-                tokio::select! {
-                    biased;
-                    o = events.offer.recv() => {
-                        if let Some(offer) = o {
-                            break offer;
-                        }
-                        bail!("socket closed before offer");
-                    }
-                    err = events.error.recv() => {
-                        if let Some(code) = err {
-                            bail!("signaling error: {code}");
-                        }
-                    }
-                }
-            };
-            Some(offer)
-        } else {
-            // Retry: timeout if offer doesn't arrive within 10s
-            let mut got_offer = None;
-            tokio::select! {
-                biased;
-                o = events.offer.recv() => {
-                    if let Some(offer) = o {
-                        got_offer = Some(offer);
-                    }
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(OFFER_TIMEOUT_SECS)) => {}
-            }
-            got_offer
-        };
+        // 6a. Wait for SDP offer from sender
+        // Drain stale signaling events from previous rounds
+        while events.offer.try_recv().is_ok() {}
+        while events.ice.try_recv().is_ok() {}
+
+        let offer_result = super::p2p_stages::await_offer(&mut events, attempt == 0).await?;
 
         let offer = match offer_result {
             Some(o) => o,
             None => {
                 attempt += 1;
-                if attempt > MAX_RETRIES {
-                    if !prompt_manual_retry().await {
-                        bail!("Sender did not reconnect after {MAX_RETRIES} retries.");
+                if policy.exhausted(attempt) {
+                    if !crate::retry::prompt_manual().await {
+                        bail!("Sender did not reconnect after {} retries.", policy.max_retries);
                     }
                     attempt = 0;
                     socket.emit_join(session_id, "recipient")?;
                     continue;
                 }
-                let delay = BACKOFF_MS.get((attempt - 1) as usize).copied().unwrap_or(4000);
-                eprintln!("\x1b[1;33m⟳\x1b[0m Retrying ({attempt}/{MAX_RETRIES}) — no offer received…");
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                crate::retry::log_retry(attempt, policy.max_retries, "no offer received…");
+                tokio::time::sleep(policy.delay(attempt)).await;
                 socket.emit_join(session_id, "recipient")?;
                 continue;
             }
@@ -257,50 +224,21 @@ async fn run_p2p(
         let mut receiver = ReceiverPeer::from_offer(offer, ice_servers.clone(), None).await?;
         socket.send_answer(receiver.answer_sdp_json()).await?;
 
-        // 8. Relay ICE candidates while waiting for DataChannel open (10s timeout)
-        let channel_open;
-        let channel_result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            async {
-                loop {
-                    tokio::select! {
-                        biased;
-                        event = receiver.next_event() => {
-                            match event {
-                                Some(crate::webrtc::LoopEvent::ChannelOpen) => return Ok::<bool, anyhow::Error>(true),
-                                Some(crate::webrtc::LoopEvent::Error(e)) => {
-                                    eprintln!("\x1b[1;33m⚠\x1b[0m WebRTC error: {e}");
-                                    return Ok(false);
-                                }
-                                Some(crate::webrtc::LoopEvent::Done) | None => return Ok(false),
-                                _ => {}
-                            }
-                        }
-                        ice = events.ice.recv() => {
-                            if let Some(c) = ice {
-                                receiver.add_ice_candidate(c)?;
-                            }
-                        }
-                    }
-                }
-            },
-        )
-        .await;
-        channel_open = matches!(channel_result, Ok(Ok(true)));
+        // 8. Wait for DataChannel open
+        let channel_open = super::p2p_stages::await_receiver_channel(&mut receiver, &mut events).await?;
 
         if !channel_open {
             attempt += 1;
-            if attempt > MAX_RETRIES {
-                if !prompt_manual_retry().await {
-                    bail!("WebRTC connection failed after {MAX_RETRIES} retries.");
+            if policy.exhausted(attempt) {
+                if !crate::retry::prompt_manual().await {
+                    bail!("WebRTC connection failed after {} retries.", policy.max_retries);
                 }
                 attempt = 0;
                 socket.emit_join(session_id, "recipient")?;
                 continue;
             }
-            let delay = BACKOFF_MS.get((attempt - 1) as usize).copied().unwrap_or(4000);
-            eprintln!("\x1b[1;33m⟳\x1b[0m Retrying ({attempt}/{MAX_RETRIES})…");
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            crate::retry::log_retry(attempt, policy.max_retries, "channel open failed…");
+            tokio::time::sleep(policy.delay(attempt)).await;
             socket.emit_join(session_id, "recipient")?;
             continue;
         }
@@ -315,15 +253,26 @@ async fn run_p2p(
 
         // 10. Collect the full transfer (metadata + chunks + end)
         let mut round_chunks: Vec<String> = Vec::new();
+        let mut sender_resume_from: usize = 0;
+        let expected_start = if last_chunk_index < 0 { 0usize } else { (last_chunk_index as usize) + 1 };
         let prior_bytes: usize = all_chunks.iter().map(|c| c.len()).sum();
         let transfer_result = receiver.receive_transfer(&proof, &|received, total| {
             let effective = prior_bytes + received;
-            eprint!("\rReceiving: {}/{}\x1b[K", super::format_size(effective), super::format_size(total));
-        }, &mut round_chunks).await;
+            super::display::receive_progress(effective, total);
+        }, &mut round_chunks, &mut sender_resume_from).await;
+
+        // If sender didn't resume from where we expected, it restarted —
+        // discard accumulated chunks to prevent data corruption.
+        if sender_resume_from < expected_start && !all_chunks.is_empty() {
+            eprintln!("\x1b[1;33m⚠\x1b[0m Sender restarted from chunk {sender_resume_from} (expected {expected_start}). Resetting accumulated data.");
+            all_chunks.clear();
+            last_chunk_index = if sender_resume_from == 0 { -1 } else { sender_resume_from as i64 - 1 };
+        }
 
         match transfer_result {
             Ok(transfer) => {
                 eprintln!();
+                super::display::status("File received");
 
                 // Build full payload from prior rounds + this round
                 let full_payload = if all_chunks.is_empty() {
@@ -334,17 +283,20 @@ async fn run_p2p(
                 };
 
                 // 11. Decrypt
+                let spinner = super::display::Spinner::start("Decrypting…");
                 let decrypted = decrypt_bytes(
                     &full_payload,
                     &transfer.encryption_metadata,
                     password,
                 )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
+                drop(spinner);
+                super::display::status("Decrypted successfully");
 
                 if let Some(expected) = &transfer.content_checksum {
                     let actual = sha256_bytes(&decrypted);
                     if actual != *expected {
-                        eprintln!("\x1b[1;33m⚠\x1b[0m Warning: Content integrity check failed. This share may have been tampered with.");
+                        super::display::warn("Warning: Content integrity check failed. This share may have been tampered with.");
                     }
                 }
 
@@ -355,11 +307,8 @@ async fn run_p2p(
                             .as_str()
                             .unwrap_or("received_file");
                         let dir = output_dir.unwrap_or(".");
-                        let filepath = PathBuf::from(dir).join(filename);
+                        let filepath = super::deduplicate_path(PathBuf::from(dir).join(filename));
                         confirm_unsafe_file(filename)?;
-                        if filepath.exists() {
-                            bail!("File already exists: {}", filepath.display());
-                        }
                         std::fs::write(&filepath, &decrypted)?;
                         log(&format!("Saved: {}", filepath.display()));
                     } else {
@@ -375,23 +324,23 @@ async fn run_p2p(
                 return Ok(());
             }
             Err(e) => {
+                eprintln!();
                 // Save partial chunks for resume on next attempt
                 last_chunk_index += round_chunks.len() as i64;
                 all_chunks.extend(round_chunks);
 
                 // Transfer interrupted — retry if possible
                 attempt += 1;
-                if attempt > MAX_RETRIES {
-                    if !prompt_manual_retry().await {
-                        bail!("Transfer failed after {MAX_RETRIES} retries: {e}");
+                if policy.exhausted(attempt) {
+                    if !crate::retry::prompt_manual().await {
+                        bail!("Transfer failed after {} retries: {e}", policy.max_retries);
                     }
                     attempt = 0;
                     socket.emit_join(session_id, "recipient")?;
                     continue;
                 }
-                let delay = BACKOFF_MS.get((attempt - 1) as usize).copied().unwrap_or(4000);
-                eprintln!("\n\x1b[1;33m⟳\x1b[0m Transfer interrupted: {e}. Retrying ({attempt}/{MAX_RETRIES})…");
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                crate::retry::log_retry(attempt, policy.max_retries, &format!("transfer interrupted: {e}"));
+                tokio::time::sleep(policy.delay(attempt)).await;
                 socket.emit_join(session_id, "recipient")?;
                 continue;
             }
@@ -442,33 +391,46 @@ pub async fn run_local(
     let mut receiver = ReceiverPeer::from_offer(offer, vec![], bind_ip).await?;
     signal.send_answer(receiver.answer_sdp_json()).await?;
 
-    // 5. Wait for DataChannel open
-    loop {
-        match receiver.next_event().await {
-            Some(crate::webrtc::LoopEvent::ChannelOpen) => {
-                log("Transfer started…");
-                break;
+    // 5. Wait for DataChannel open (with timeout)
+    let channel_open = tokio::time::timeout(
+        std::time::Duration::from_secs(crate::retry::CHANNEL_TIMEOUT_SECS),
+        async {
+            loop {
+                match receiver.next_event().await {
+                    Some(crate::webrtc::LoopEvent::ChannelOpen) => return Ok::<(), anyhow::Error>(()),
+                    Some(crate::webrtc::LoopEvent::Error(e)) => bail!("WebRTC error: {e}"),
+                    Some(crate::webrtc::LoopEvent::Done) | None => bail!("WebRTC closed before transfer"),
+                    _ => {}
+                }
             }
-            Some(crate::webrtc::LoopEvent::Error(e)) => bail!("WebRTC error: {e}"),
-            Some(crate::webrtc::LoopEvent::Done) | None => bail!("WebRTC closed before transfer"),
-            _ => {}
-        }
+        },
+    )
+    .await;
+    match channel_open {
+        Ok(Ok(())) => log("Transfer started…"),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => bail!("DataChannel open timed out"),
     }
 
     // 6. Receive transfer (verify + metadata + chunks + end)
     let mut chunks: Vec<String> = Vec::new();
+    let mut _local_resume_from: usize = 0;
     let transfer = receiver.receive_transfer(&proof, &|received, total| {
         eprint!("\rReceiving: {}/{}\x1b[K", super::format_size(received), super::format_size(total));
-    }, &mut chunks).await?;
+    }, &mut chunks, &mut _local_resume_from).await?;
     eprintln!();
+    super::display::status("File received");
 
     // 7. Decrypt
+    let spinner = super::display::Spinner::start("Decrypting…");
     let decrypted = decrypt_bytes(
         &transfer.encrypted_payload,
         &transfer.encryption_metadata,
         &password,
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
+    drop(spinner);
+    super::display::status("Decrypted successfully");
 
     if let Some(expected) = &transfer.content_checksum {
         let actual = sha256_bytes(&decrypted);
@@ -484,11 +446,8 @@ pub async fn run_local(
                 .as_str()
                 .unwrap_or("received_file");
             let dir = output_dir.as_deref().unwrap_or(".");
-            let filepath = PathBuf::from(dir).join(filename);
+            let filepath = super::deduplicate_path(PathBuf::from(dir).join(filename));
             confirm_unsafe_file(filename)?;
-            if filepath.exists() {
-                bail!("File already exists: {}", filepath.display());
-            }
             std::fs::write(&filepath, &decrypted)?;
             log(&format!("Saved: {}", filepath.display()));
         } else {
@@ -699,20 +658,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn errors_if_output_file_exists() {
+    async fn deduplicates_output_file_if_exists() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("data.zip"), b"existing").unwrap();
 
         let password = "filepass";
+        let content = b"\x01";
         let (server, url) = mock_server().await;
-        mount_file_share(&server, "dup", b"\x01", password, "data.zip").await;
+        mount_file_share(&server, "dup", content, password, "data.zip").await;
 
         let dir = tmp.path().to_str().unwrap().to_owned();
-        let err = run("https://example.com/s/dup", password, Some(dir), Some(url), &mut |_| {})
+        run("https://example.com/s/dup", password, Some(dir.clone()), Some(url), &mut |_| {})
             .await
-            .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.to_lowercase().contains("already exists"), "unexpected error: {msg:?}");
+            .unwrap();
+
+        // Original file untouched
+        assert_eq!(std::fs::read(tmp.path().join("data.zip")).unwrap(), b"existing");
+        // New file saved with deduplicated name
+        let deduped = tmp.path().join("data (1).zip");
+        assert!(deduped.exists(), "expected deduplicated file at {:?}", deduped);
+        assert_eq!(std::fs::read(&deduped).unwrap(), content);
     }
 
     #[tokio::test]
@@ -877,5 +842,74 @@ mod tests {
         // Verify BareId is the parsed result for plain IDs
         let parsed = parse_share_url("bare123");
         assert_eq!(parsed, ParsedUrl::BareId { id: "bare123".into() });
+    }
+
+    // ── Resume logic: sender restart detection ───────────────────────────
+
+    /// Simulate the receiver's accumulated state when sender reports
+    /// resumeFromChunk = 0 but receiver expected to resume from chunk N.
+    /// The receiver must discard accumulated data to avoid corruption.
+    #[test]
+    fn resume_mismatch_resets_accumulated_chunks() {
+        let mut all_chunks: Vec<String> = vec!["aaaa".into(), "bbbb".into(), "cccc".into()];
+        let mut last_chunk_index: i64 = 2; // received chunks 0,1,2
+        let sender_resume_from: usize = 0; // sender restarted from 0!
+        let expected_start: usize = (last_chunk_index as usize) + 1; // expected 3
+
+        // This replicates the logic in run_p2p (line ~265)
+        if sender_resume_from < expected_start && !all_chunks.is_empty() {
+            all_chunks.clear();
+            last_chunk_index = if sender_resume_from == 0 {
+                -1
+            } else {
+                sender_resume_from as i64 - 1
+            };
+        }
+
+        assert!(all_chunks.is_empty(), "accumulated chunks must be cleared on mismatch");
+        assert_eq!(last_chunk_index, -1, "chunk index must reset to -1 when sender starts from 0");
+    }
+
+    /// When sender resumes from the expected offset, accumulated data is kept.
+    #[test]
+    fn resume_match_preserves_accumulated_chunks() {
+        let mut all_chunks: Vec<String> = vec!["aaaa".into(), "bbbb".into()];
+        let mut last_chunk_index: i64 = 1; // received chunks 0,1
+        let sender_resume_from: usize = 2; // sender resumes from chunk 2 — correct!
+        let expected_start: usize = (last_chunk_index as usize) + 1;
+
+        if sender_resume_from < expected_start && !all_chunks.is_empty() {
+            all_chunks.clear();
+            last_chunk_index = if sender_resume_from == 0 {
+                -1
+            } else {
+                sender_resume_from as i64 - 1
+            };
+        }
+
+        assert_eq!(all_chunks.len(), 2, "chunks must be preserved when resume matches");
+        assert_eq!(last_chunk_index, 1, "chunk index must stay unchanged");
+    }
+
+    /// When sender partially resumes (e.g. got resume frame late, starts from chunk 1
+    /// but receiver had chunks 0,1,2), receiver discards and trusts the sender.
+    #[test]
+    fn resume_partial_mismatch_resets_to_sender_offset() {
+        let mut all_chunks: Vec<String> = vec!["aaaa".into(), "bbbb".into(), "cccc".into()];
+        let mut last_chunk_index: i64 = 2;
+        let sender_resume_from: usize = 1; // sender resumes from chunk 1, not 3
+        let expected_start: usize = (last_chunk_index as usize) + 1;
+
+        if sender_resume_from < expected_start && !all_chunks.is_empty() {
+            all_chunks.clear();
+            last_chunk_index = if sender_resume_from == 0 {
+                -1
+            } else {
+                sender_resume_from as i64 - 1
+            };
+        }
+
+        assert!(all_chunks.is_empty());
+        assert_eq!(last_chunk_index, 0, "chunk index must be sender_resume_from - 1");
     }
 }

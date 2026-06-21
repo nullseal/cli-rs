@@ -28,15 +28,16 @@
 
 ## Constants
 
+All retry constants are centralized in `src/retry.rs`:
+
 | Constant | Value | Location |
 |----------|-------|----------|
-| `MAX_RETRIES` | 3 | `commands/share.rs`, `commands/get.rs` |
-| `BACKOFF_MS` | [1000, 2000, 4000] | both sender/receiver |
-| `READY_TIMEOUT_SECS` | 10 | sender (waiting for `p2p:ready`) |
-| `OFFER_TIMEOUT_SECS` | 10 | receiver (waiting for offer) |
-| `RESUME_WAIT_MS` | 2000 | sender (waiting for resume frame) |
-| `CHUNK_SIZE` | 16384 (16 KB) | `webrtc.rs` |
-| Channel open timeout | 10s | both (WebRTC ICE connection) |
+| `DEFAULT.max_retries` | 3 | `retry.rs` |
+| `DEFAULT.backoff_ms` | [1000, 2000, 4000] | `retry.rs` |
+| `PEER_TIMEOUT_SECS` | 10 | `retry.rs` (sender: p2p:ready, receiver: offer) |
+| `CHANNEL_TIMEOUT_SECS` | 10 | `retry.rs` (WebRTC ICE connection) |
+| `RESUME_WAIT_MS` | 5000 | `retry.rs` (sender waits for resume frame) |
+| `CHUNK_SIZE` | 16384 (16 KB) | `webrtc/mod.rs` |
 
 ---
 
@@ -79,11 +80,12 @@ Sender                    Server                   Receiver
 
 ### Retry Decision Points
 
-The sender has **three** places where retry triggers:
+The sender has **four** places where retry triggers:
 
 1. **`p2p:ready` timeout** (recipient not joining/re-joining within 10s)
 2. **DataChannel open timeout** (ICE/DTLS failure within 10s)
-3. *(No transfer-level retry on sender — once DataChannel is open, `send_transfer_from` is synchronous)*
+3. **Transfer failure** (`send_transfer_from` returns error — event loop closed, SCTP failure)
+4. **Stale signaling flush** — before each new SDP exchange, stale `answer`/`ice` events from previous rounds are drained
 
 ### Retry Logic (Pseudocode)
 
@@ -129,9 +131,19 @@ loop {
     
     // SUCCESS — reset counter, send data
     attempt = 0;
-    let start_chunk = sender.wait_for_resume(2000ms);
+    let start_chunk = sender.wait_for_resume(5000ms);
     sender.send_verify(&proof);
-    sender.send_transfer_from(..., start_chunk, ...);
+    let result = sender.send_transfer_from(..., start_chunk, ...).await;
+    
+    if result.is_err() {
+        // Transfer interrupted — retry
+        sender.close();
+        sender.wait_closed();
+        attempt += 1;
+        // Same retry/prompt logic as above
+        socket.emit_join(session_id, "sender");
+        continue;
+    }
     break; // done
 }
 ```
@@ -141,8 +153,10 @@ loop {
 - **First attempt**: waits indefinitely for `p2p:ready` (recipient hasn't joined yet)
 - **Retry attempts**: wait max 10s for `p2p:ready`
 - **Re-join on retry**: `socket.emit_join()` tells server we're re-joining, triggers fresh signaling round
+- **Stale event drain**: before creating a new SenderPeer, stale `answer`/`ice` events are flushed from channels to prevent feeding old SDP to the new peer
 - **Reset on success**: `attempt = 0` after DataChannel opens (independent of prior failures)
-- **Resume support**: sender waits 2s for resume frame; if none arrives, sends from chunk 0
+- **Resume support**: sender waits 5s for resume frame; receiver sends it 3× for redundancy; if none arrives, sends from chunk 0
+- **Transfer retry**: if `send_transfer_from` fails mid-transfer, the sender retries with backoff (recipient will send resume frame on reconnect)
 
 ---
 
@@ -277,22 +291,22 @@ loop {
 
 ### Sender (`share.rs::run_local`)
 
-**No retry mechanism.** Single attempt:
+**No retry mechanism.** Single attempt with timeout:
 1. Bind TCP signaling server
 2. Broadcast via mDNS
 3. Accept one receiver connection
 4. WebRTC handshake (offer/answer via TCP)
-5. Wait for DataChannel open
+5. Wait for DataChannel open **(10s timeout)**
 6. Send transfer
 7. Done
 
 ### Receiver (`get.rs::run_local`)
 
-**No retry mechanism.** Single attempt:
+**No retry mechanism.** Single attempt with timeout:
 1. Discover sender via mDNS (30s timeout)
 2. Connect to sender's TCP signaling server
 3. Receive offer, create peer, send answer
-4. Wait for DataChannel open
+4. Wait for DataChannel open **(10s timeout)**
 5. Receive transfer
 6. Done
 
@@ -304,14 +318,14 @@ loop {
 | Backoff delays | ✓ [1s,2s,4s] | ✗ | **Yes** |
 | Manual retry prompt | ✓ (Enter/Ctrl+C) | ✗ | **Yes** |
 | Resume transfer | ✓ (chunk-index) | ✗ | **Yes** |
-| DataChannel open timeout | ✓ (10s) | ✗ (waits forever) | **Yes** |
+| DataChannel open timeout | ✓ (10s) | ✓ (10s) | No |
 | Offer/ready timeout | ✓ (10s on retry) | N/A (TCP direct) | N/A |
 
 ---
 
-## Manual Retry (`prompt_manual_retry`)
+## Manual Retry (`retry::prompt_manual`)
 
-After 3 auto-retries are exhausted, the CLI prompts interactively:
+After 3 auto-retries are exhausted, the CLI prompts interactively (from `src/retry.rs`):
 
 ```
 ⚠ All automatic retries exhausted.
@@ -328,16 +342,37 @@ Press Enter to retry or Ctrl+C to quit…
 
 ### Sender Side (`SenderPeer::wait_for_resume`)
 
-After DataChannel opens, sender waits up to 2000ms for a `resume` frame:
+After DataChannel opens, sender waits up to **5000ms** for a `resume` frame:
 - Receives `{ type: "resume", chunkIndex: N }` → sends from chunk `N+1`
 - Timeout (no frame) → sends from chunk 0
 - Error/Done event → sends from chunk 0
 
+The metadata frame includes `"resumeFromChunk": start_chunk` so the receiver
+can detect whether the sender actually resumed or restarted from scratch.
+
 ### Receiver Side (`ReceiverPeer::send_resume`)
 
-After DataChannel opens, receiver immediately sends:
+After DataChannel opens, receiver immediately sends the resume frame **3 times**
+for redundancy (guards against TURN relay latency causing the first frame to
+arrive after the sender's timeout):
 - First connection: `{ type: "resume", chunkIndex: -1 }` (start from beginning)
 - Retry after partial: `{ type: "resume", chunkIndex: last_received_index }`
+
+**Important**: The receiver's event loop captures the incoming DataChannel ID on
+`ChannelOpen` (since the receiver doesn't create the channel — the sender does).
+Without this, `send_resume` frames would be queued in `pending_sends` but never
+written to SCTP. Fixed in v0.15.3 by making `channel_id` mutable in `event_loop::run`.
+
+### Sender-Restart Detection (Receiver)
+
+After calling `receive_transfer`, the receiver checks the sender's
+`resumeFromChunk` value from the metadata frame:
+- If `resumeFromChunk < expected_start` AND accumulated chunks exist →
+  the sender restarted (e.g. missed the resume frame). The receiver **discards
+  all accumulated data** and resets `last_chunk_index` to avoid data corruption
+  from concatenating duplicate chunks.
+- If `resumeFromChunk >= expected_start` → resume is correct, accumulated
+  data is preserved.
 
 ### Chunk Indexing
 
@@ -423,13 +458,49 @@ Defer local mode retry unless users report reliability issues on LAN. The global
 
 ---
 
+## Module Architecture
+
+### Retry Module (`src/retry.rs`)
+
+Centralizes all retry-related logic previously duplicated across `share.rs` and `get.rs`:
+- `RetryPolicy` struct with `max_retries` and `backoff_ms`
+- `DEFAULT` constant policy (3 retries, [1s,2s,4s])
+- Timeout constants: `PEER_TIMEOUT_SECS`, `CHANNEL_TIMEOUT_SECS`, `RESUME_WAIT_MS`
+- `prompt_manual()` — interactive retry prompt (moved from `commands/mod.rs`)
+- `log_retry()` — ANSI-formatted retry status
+
+### P2P Stages (`src/commands/p2p_stages.rs`)
+
+Extracted connection stage helpers used by both sender and receiver:
+- `await_ready()` — sender waits for `p2p:ready` (infinite or timeout)
+- `await_offer()` — receiver waits for SDP offer (infinite or timeout)
+- `await_answer()` — sender collects answer + relays ICE candidates
+- `await_sender_channel()` — sender waits for DataChannel open + relays ICE
+- `await_receiver_channel()` — receiver waits for DataChannel open + relays ICE
+
+### WebRTC Module (`src/webrtc/`)
+
+Split from monolithic `webrtc.rs` into:
+- `mod.rs` — shared types, re-exports
+- `net.rs` — IP discovery, UDP binding (11 tests)
+- `event_loop.rs` — sans-I/O loop
+- `sender.rs` — SenderPeer (5 tests)
+- `receiver.rs` — ReceiverPeer
+
+---
+
 ## Test Coverage
 
-### Unit Tests (inline in source)
+### Unit Tests (inline in source, 101 total)
 
+- `retry.rs`: 3 tests (delay, clamp, exhaustion boundary)
 - `commands/share.rs`: 15+ tests covering validation, server mode, P2P flow
-- `commands/get.rs`: 11+ tests covering URL parsing, server mode, P2P flow
-- `webrtc.rs`: IP detection, LAN detection, `is_private_lan_ip`
+- `commands/get.rs`: 15+ tests covering URL parsing, server mode, P2P flow
+- `webrtc/net.rs`: 11 tests (IP detection, LAN detection, `is_private_lan_ip`)
+- `webrtc/sender.rs`: 5 tests (resume, transfer_from)
+- `commands/display.rs`: 7 tests (ANSI strip, display width, hline)
+- `crypto.rs`: 4 tests (round-trip, cross-compat, wrong password)
+- `api.rs`: 8+ tests (mock server HTTP flows)
 
 ### E2E Tests (`e2e/tests/cli-retry.integration.spec.ts`)
 

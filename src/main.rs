@@ -6,6 +6,7 @@ mod commands;
 mod crypto;
 mod local;
 mod local_signal;
+mod retry;
 mod socket;
 mod webrtc;
 
@@ -140,8 +141,16 @@ fn prompt_password() -> String {
     rpassword::read_password().unwrap_or_default()
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()
+        .expect("failed to build tokio runtime");
+    rt.block_on(async_main());
+}
+
+async fn async_main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
