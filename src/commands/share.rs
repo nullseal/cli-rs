@@ -359,7 +359,7 @@ async fn run_p2p(
     let ice_servers = client.get_ice_servers().await.unwrap_or_default();
 
     // 4. Connect socket as sender
-    let (socket, mut events) = P2PSocket::connect(&base, &session.session_id, "sender").await?;
+    let (mut socket, mut events) = P2PSocket::connect(&base, &session.session_id, "sender").await?;
 
     // 5. Wait for joined ack
     tokio::select! {
@@ -375,6 +375,23 @@ async fn run_p2p(
     // 6. Retry loop for WebRTC connection + transfer
     let policy = &crate::retry::DEFAULT;
     let mut attempt = 0u32;
+
+    // Helper: reconnect socket if dead, then emit join
+    macro_rules! rejoin {
+        () => {{
+            if !socket.is_alive() {
+                let (new_socket, new_events) = P2PSocket::connect(&base, &session.session_id, "sender").await?;
+                socket = new_socket;
+                events = new_events;
+                // Wait for joined ack on new socket
+                events.joined.recv().await
+                    .ok_or_else(|| anyhow::anyhow!("socket closed before joined on reconnect"))?;
+            } else {
+                socket.emit_join(&session.session_id, "sender")?;
+            }
+        }};
+    }
+
     loop {
         // 6a. Wait for ready (recipient has joined)
         let got_ready = super::p2p_stages::await_ready(&mut events, attempt == 0).await?;
@@ -386,12 +403,12 @@ async fn run_p2p(
                     bail!("Recipient did not rejoin after {} retries.", policy.max_retries);
                 }
                 attempt = 0;
-                socket.emit_join(&session.session_id, "sender")?;
+                rejoin!();
                 continue;
             }
             crate::retry::log_retry(attempt, policy.max_retries, "recipient not ready…");
             tokio::time::sleep(policy.delay(attempt)).await;
-            socket.emit_join(&session.session_id, "sender")?;
+            rejoin!();
             continue;
         }
         super::display::status("Recipient connected. Starting transfer…");
@@ -417,12 +434,12 @@ async fn run_p2p(
                     bail!("WebRTC connection failed after {} retries.", policy.max_retries);
                 }
                 attempt = 0;
-                socket.emit_join(&session.session_id, "sender")?;
+                rejoin!();
                 continue;
             }
             crate::retry::log_retry(attempt, policy.max_retries, "channel open failed…");
             tokio::time::sleep(policy.delay(attempt)).await;
-            socket.emit_join(&session.session_id, "sender")?;
+            rejoin!();
             continue;
         }
 
@@ -466,7 +483,7 @@ async fn run_p2p(
                 crate::retry::log_retry(attempt, policy.max_retries, &format!("transfer interrupted: {e}"));
                 tokio::time::sleep(policy.delay(attempt)).await;
             }
-            socket.emit_join(&session.session_id, "sender")?;
+            rejoin!();
             continue;
         }
 

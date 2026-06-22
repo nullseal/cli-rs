@@ -9,6 +9,8 @@
 use anyhow::{bail, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -27,6 +29,7 @@ pub struct P2PEvents {
 /// Thin wrapper around a WebSocket connection speaking Socket.IO v4.
 pub struct P2PSocket {
     tx: mpsc::UnboundedSender<String>,
+    alive: Arc<AtomicBool>,
 }
 
 impl P2PSocket {
@@ -82,13 +85,21 @@ impl P2PSocket {
         // Spawn reader/writer loop
         // EIO4: the SERVER sends pings ("2") and the client replies with pongs ("3").
         // We track when the last server ping arrived; if none comes within
-        // pingInterval + pingTimeout, the connection is considered dead.
+        // the deadline, the connection is considered dead.
+        // Cap at 15s for faster dead-connection detection (server default is 45s).
         let ping_timeout = eio_config["pingTimeout"].as_u64().unwrap_or(20000);
-        let server_deadline = std::time::Duration::from_millis(ping_interval + ping_timeout);
+        let raw_deadline_ms = ping_interval + ping_timeout;
+        let server_deadline = std::time::Duration::from_millis(raw_deadline_ms.min(15_000));
+
+        let alive = Arc::new(AtomicBool::new(true));
+        let alive_flag = alive.clone();
 
         tokio::spawn(async move {
             let mut deadline = tokio::time::interval(server_deadline);
             deadline.tick().await; // skip first immediate tick
+            // Client-side probe: send EIO ping every 10s to detect dead connections faster
+            let mut probe = tokio::time::interval(std::time::Duration::from_secs(10));
+            probe.tick().await; // skip first immediate tick
             let mut last_pong = tokio::time::Instant::now();
 
             loop {
@@ -99,10 +110,10 @@ impl P2PSocket {
                         match msg {
                             Some(m) => {
                                 if sink.send(Message::Text(m.into())).await.is_err() {
-                                    return;
+                                    break;
                                 }
                             }
-                            None => return,
+                            None => break,
                         }
                     }
 
@@ -142,10 +153,10 @@ impl P2PSocket {
                                         }
                                     }
                                 } else if text.starts_with("41/p2p") {
-                                    return;
+                                    break;
                                 }
                             }
-                            Some(Ok(Message::Close(_))) | None => return,
+                            Some(Ok(Message::Close(_))) | None => break,
                             _ => {}
                         }
                     }
@@ -153,11 +164,20 @@ impl P2PSocket {
                     _ = deadline.tick() => {
                         // If no server ping arrived within the deadline, connection is dead
                         if last_pong.elapsed() > server_deadline {
-                            return;
+                            break;
+                        }
+                    }
+
+                    _ = probe.tick() => {
+                        // Send client-side EIO ping to elicit a pong from the server
+                        if sink.send(Message::Text("2".into())).await.is_err() {
+                            break;
                         }
                     }
                 }
             }
+
+            alive_flag.store(false, Ordering::Release);
         });
 
         // Step 4: Emit p2p:join
@@ -165,7 +185,7 @@ impl P2PSocket {
         out_tx.send(join_msg)?;
 
         Ok((
-            P2PSocket { tx: out_tx },
+            P2PSocket { tx: out_tx, alive },
             P2PEvents {
                 joined: joined_rx,
                 ready: ready_rx,
@@ -196,6 +216,12 @@ impl P2PSocket {
     pub fn emit_join(&self, session_id: &str, role: &str) -> Result<()> {
         self.tx.send(encode_event("p2p:join", &json!({ "sessionId": session_id, "role": role })))?;
         Ok(())
+    }
+
+    /// Returns `true` if the underlying WebSocket task is still running.
+    /// When `false`, the socket is dead and must be recreated with `connect()`.
+    pub fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Acquire)
     }
 
     pub async fn disconnect(&self) -> Result<()> {
@@ -238,5 +264,83 @@ where
             Some(Err(e)) => bail!("websocket error: {e}"),
             None => bail!("websocket closed"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_event_formats_socketio_v4() {
+        let msg = encode_event("p2p:join", &json!({"sessionId": "abc", "role": "sender"}));
+        assert!(msg.starts_with("42/p2p,"));
+        let json_part = msg.strip_prefix("42/p2p,").unwrap();
+        let arr: Vec<Value> = serde_json::from_str(json_part).unwrap();
+        assert_eq!(arr[0], "p2p:join");
+        assert_eq!(arr[1]["sessionId"], "abc");
+        assert_eq!(arr[1]["role"], "sender");
+    }
+
+    #[test]
+    fn build_ws_url_converts_http_to_ws() {
+        let url = build_ws_url("http://localhost:3001").unwrap();
+        assert!(url.starts_with("ws://localhost:3001/socket.io/"));
+        assert!(url.contains("EIO=4"));
+        assert!(url.contains("transport=websocket"));
+    }
+
+    #[test]
+    fn build_ws_url_converts_https_to_wss() {
+        let url = build_ws_url("https://api.nullseal.com").unwrap();
+        assert!(url.starts_with("wss://api.nullseal.com/socket.io/"));
+    }
+
+    #[tokio::test]
+    async fn is_alive_true_initially_false_after_disconnect() {
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::accept_async;
+
+        // Bind a local WS server
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Spawn server that does EIO handshake then namespace connect
+        let server_handle = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = accept_async(stream).await.unwrap();
+            // EIO open
+            ws.send(Message::Text(
+                r#"0{"sid":"test","upgrades":[],"pingInterval":25000,"pingTimeout":20000,"maxPayload":100000}"#.into(),
+            )).await.unwrap();
+            // Wait for namespace connect request (40/p2p,)
+            let _ = ws.next().await;
+            // Send namespace connect ack
+            ws.send(Message::Text("40/p2p,{\"sid\":\"nsid\"}".into())).await.unwrap();
+            // Wait for p2p:join
+            let _ = ws.next().await;
+            // Send p2p:joined
+            ws.send(Message::Text("42/p2p,[\"p2p:joined\"]".into())).await.unwrap();
+            // Give client time to read
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            // Close the connection
+            let _ = ws.close(None).await;
+        });
+
+        let server_url = format!("http://127.0.0.1:{}", addr.port());
+        let (socket, mut events) = P2PSocket::connect(&server_url, "sess1", "sender").await.unwrap();
+
+        // Wait for joined
+        events.joined.recv().await.unwrap();
+
+        // Should be alive right after connect
+        assert!(socket.is_alive());
+
+        // Wait for server to close connection
+        server_handle.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // After server closed, socket task should exit → is_alive = false
+        assert!(!socket.is_alive());
     }
 }
