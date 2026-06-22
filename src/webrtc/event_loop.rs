@@ -135,7 +135,16 @@ pub async fn run(
                                     while pending_sends.len() < MAX_PENDING {
                                         match cmd_rx.try_recv() {
                                             Ok(LoopCmd::SendData(f)) => pending_sends.push_back(f),
-                                            Ok(LoopCmd::Close) => { closing = true; break; }
+                                            Ok(LoopCmd::Close) => {
+                                                // Drain all remaining SendData from channel
+                                                while let Ok(remaining) = cmd_rx.try_recv() {
+                                                    if let LoopCmd::SendData(f) = remaining {
+                                                        pending_sends.push_back(f);
+                                                    }
+                                                }
+                                                closing = true;
+                                                break;
+                                            }
                                             Ok(LoopCmd::AddIceCandidate(v)) => {
                                                 if let Some(c) = json_to_ice(&v) {
                                                     rtc.add_remote_candidate(c);
@@ -155,6 +164,12 @@ pub async fn run(
                                     }
                                 }
                                 Some(LoopCmd::Close) | None => {
+                                    // Drain all remaining SendData from channel before closing
+                                    while let Ok(remaining) = cmd_rx.try_recv() {
+                                        if let LoopCmd::SendData(f) = remaining {
+                                            pending_sends.push_back(f);
+                                        }
+                                    }
                                     closing = true;
                                 }
                             }

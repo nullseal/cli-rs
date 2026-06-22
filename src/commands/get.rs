@@ -113,12 +113,11 @@ async fn run_server(
 
     // Step 3: submit answer to get payload (server auto-consumes one-time shares)
     let payload = client.get_share_payload(share_id, &answer, &metadata.verify_id).await?;
-    super::display::status(&format!("Received {}", super::format_size(payload.encrypted_payload.len())));
     let spinner = super::display::Spinner::start("Decrypting…");
     let decrypted = decrypt_bytes(&payload.encrypted_payload, &payload.encryption_metadata, password)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
     drop(spinner);
-    super::display::status("Decrypted successfully");
+    super::display::status(&format!("Decrypted successfully ({})", super::format_size(decrypted.len())));
 
     let actual_checksum = sha256_bytes(&decrypted);
     if actual_checksum != payload.content_checksum {
@@ -306,7 +305,7 @@ async fn run_p2p(
                 )
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
                 drop(spinner);
-                super::display::status("Decrypted successfully");
+                super::display::status(&format!("Decrypted successfully ({})", super::format_size(decrypted.len())));
 
                 if let Some(expected) = &transfer.content_checksum {
                     let actual = sha256_bytes(&decrypted);

@@ -226,12 +226,12 @@ pub async fn run_local(
             eprint!("\rSending: {}/{}\x1b[K", super::format_size(sent), super::format_size(total));
         },
     ).await?;
+
+    // 10. Wait for data to flush, then cleanup
+    sender.close_and_flush().await;
+    sender.wait_closed().await;
     eprintln!();
     eprintln!("\x1b[1;32m✓\x1b[0m Transfer complete.");
-
-    // 10. Cleanup
-    sender.close();
-    sender.wait_closed().await;
     Ok(())
 }
 
@@ -487,13 +487,14 @@ async fn run_p2p(
             continue;
         }
 
+        // 12. Wait for data to flush, then signal done + cleanup
+        sender.close_and_flush().await;
+        sender.wait_closed().await;
+
         eprintln!();
         super::display::status("Transfer complete.");
 
-        // 12. Signal done + cleanup
         socket.done().await?;
-        sender.close();
-        sender.wait_closed().await;
         socket.disconnect().await?;
         return Ok(());
     }

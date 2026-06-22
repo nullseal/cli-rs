@@ -86,10 +86,10 @@ impl P2PSocket {
         // EIO4: the SERVER sends pings ("2") and the client replies with pongs ("3").
         // We track when the last server ping arrived; if none comes within
         // the deadline, the connection is considered dead.
-        // Cap at 15s for faster dead-connection detection (server default is 45s).
-        let ping_timeout = eio_config["pingTimeout"].as_u64().unwrap_or(20000);
-        let raw_deadline_ms = ping_interval + ping_timeout;
-        let server_deadline = std::time::Duration::from_millis(raw_deadline_ms.min(15_000));
+        // Use pingInterval + 5s as deadline (~30s) for faster detection than the
+        // full pingInterval + pingTimeout (45s), while still allowing the first
+        // server ping to arrive.
+        let server_deadline = std::time::Duration::from_millis(ping_interval + 5000);
 
         let alive = Arc::new(AtomicBool::new(true));
         let alive_flag = alive.clone();
@@ -97,9 +97,6 @@ impl P2PSocket {
         tokio::spawn(async move {
             let mut deadline = tokio::time::interval(server_deadline);
             deadline.tick().await; // skip first immediate tick
-            // Client-side probe: send EIO ping every 10s to detect dead connections faster
-            let mut probe = tokio::time::interval(std::time::Duration::from_secs(10));
-            probe.tick().await; // skip first immediate tick
             let mut last_pong = tokio::time::Instant::now();
 
             loop {
@@ -164,13 +161,6 @@ impl P2PSocket {
                     _ = deadline.tick() => {
                         // If no server ping arrived within the deadline, connection is dead
                         if last_pong.elapsed() > server_deadline {
-                            break;
-                        }
-                    }
-
-                    _ = probe.tick() => {
-                        // Send client-side EIO ping to elicit a pong from the server
-                        if sink.send(Message::Text("2".into())).await.is_err() {
                             break;
                         }
                     }

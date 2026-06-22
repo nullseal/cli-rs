@@ -205,6 +205,12 @@ impl SenderPeer {
         let _ = self.cmd_tx.try_send(LoopCmd::Close);
     }
 
+    /// Send Close and wait for the event loop to finish flushing all queued data.
+    pub async fn close_and_flush(&self) {
+        // Use .send() to ensure Close reaches the event loop even when channel is full
+        let _ = self.cmd_tx.send(LoopCmd::Close).await;
+    }
+
     pub async fn wait_closed(self) {
         let _ = self.loop_handle.await;
     }
@@ -328,5 +334,44 @@ mod tests {
         event_tx.send(LoopEvent::Done).unwrap();
         let result = peer.wait_for_resume(2000).await;
         assert_eq!(result, 0);
+    }
+
+    #[tokio::test]
+    async fn close_and_flush_delivers_close_after_queued_data() {
+        // Fill the channel with data, then call close_and_flush.
+        // Verify Close arrives AFTER the data.
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<LoopCmd>(4); // small capacity
+        let (_event_tx, event_rx) = mpsc::unbounded_channel();
+        let loop_handle = tokio::spawn(async {});
+        let peer = SenderPeer {
+            cmd_tx,
+            event_rx,
+            offer_sdp: String::new(),
+            loop_handle,
+        };
+
+        // Fill channel to capacity
+        for i in 0..4 {
+            peer.send_frame(format!("frame-{i}")).await.unwrap();
+        }
+
+        // close_and_flush must wait for space (channel full) and then deliver Close
+        let flush_handle = tokio::spawn(async move {
+            peer.close_and_flush().await;
+        });
+
+        // Drain data frames
+        let mut frames = Vec::new();
+        for _ in 0..4 {
+            if let Some(LoopCmd::SendData(f)) = cmd_rx.recv().await {
+                frames.push(f);
+            }
+        }
+
+        // Now Close should arrive
+        flush_handle.await.unwrap();
+        let close_cmd = cmd_rx.recv().await;
+        assert!(matches!(close_cmd, Some(LoopCmd::Close)));
+        assert_eq!(frames, vec!["frame-0", "frame-1", "frame-2", "frame-3"]);
     }
 }
