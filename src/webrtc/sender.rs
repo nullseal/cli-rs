@@ -9,9 +9,11 @@ use super::event_loop;
 use super::net::bind_udp;
 use super::{build_rtc, LoopCmd, LoopEvent, CHUNK_SIZE};
 
-/// Bounded channel capacity — limits how many frames can be queued before
-/// the sender must wait, providing backpressure for large transfers.
-const CMD_CHANNEL_CAPACITY: usize = 256;
+/// Bounded channel capacity — kept small so the sender's progress display
+/// closely tracks what the event loop has actually consumed.  Together with
+/// MAX_PENDING in event_loop.rs the sender can be at most ~28 frames
+/// (~448 KB) ahead of SCTP writes.
+const CMD_CHANNEL_CAPACITY: usize = 4;
 
 pub struct SenderPeer {
     cmd_tx: mpsc::Sender<LoopCmd>,

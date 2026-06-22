@@ -5,7 +5,7 @@ use serde_json::Value;
 use str0m::change::{SdpAnswer, SdpPendingOffer};
 use str0m::channel::ChannelId;
 use str0m::net::Protocol;
-use str0m::{Event, Input, Output, Rtc};
+use str0m::{Event, IceConnectionState, Input, Output, Rtc};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -18,8 +18,9 @@ const MAX_DRAIN_PER_CYCLE: usize = 64;
 /// Max frames buffered locally in `pending_sends` before we stop reading from
 /// the command channel. This ensures true end-to-end backpressure: when str0m
 /// can't keep up, pending_sends fills → we stop reading → channel fills →
-/// sender's send_frame().await blocks.
-const MAX_PENDING: usize = 128;
+/// sender's send_frame().await blocks.  Kept small so that sender-side
+/// progress reporting stays close to actual SCTP delivery.
+const MAX_PENDING: usize = 24;
 
 /// Parse a browser RTCIceCandidateInit JSON to a str0m Candidate.
 fn json_to_ice(v: &Value) -> Option<str0m::Candidate> {
@@ -190,6 +191,12 @@ pub async fn run(
 
                 Ok(Output::Event(e)) => {
                     match e {
+                        Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
+                            let _ = event_tx.send(LoopEvent::Error(
+                                "ICE disconnected (network change or peer lost)".to_string(),
+                            ));
+                            return;
+                        }
                         Event::ChannelOpen(id, _label) => {
                             if channel_id.map_or(true, |cid| cid == id) {
                                 channel_open = true;
