@@ -49,6 +49,7 @@ pub async fn run(
     let owner_code = owner_code.into();
     let action = action.into();
     let content_type_flag = content_type_flag.into();
+    let _ = output; // status now routed through the leveled logger
 
     let (share_id, full_owner_code) = parse_owner_code(&owner_code)?;
 
@@ -64,7 +65,7 @@ pub async fn run(
             }
 
             // Verify ownership first
-            output("Verifying ownership…");
+            super::log::step("Verifying ownership…");
             let info = client.verify_owner(share_id, full_owner_code).await?;
 
             // Resolve content type
@@ -88,7 +89,7 @@ pub async fn run(
             let challenge = generate_challenge(&password);
 
             // Replace
-            output("Replacing share content…");
+            super::log::step("Replacing share content…");
             client
                 .replace_share(
                     share_id,
@@ -106,16 +107,16 @@ pub async fn run(
                 )
                 .await?;
 
-            eprintln!("\x1b[1;32m✓\x1b[0m Share content replaced successfully.");
+            super::display::status("Share content replaced successfully.");
         }
         "destroy" => {
-            output("Verifying ownership…");
+            super::log::step("Verifying ownership…");
             client.verify_owner(share_id, full_owner_code).await?;
 
-            output("Destroying share…");
+            super::log::step("Destroying share…");
             client.destroy_share(share_id, full_owner_code).await?;
 
-            eprintln!("\x1b[1;32m✓\x1b[0m Share destroyed.");
+            super::display::status("Share destroyed.");
         }
         _ => {
             bail!("Unknown action: '{action}'. Use --replace or --destroy.");

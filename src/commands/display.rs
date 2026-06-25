@@ -153,32 +153,41 @@ fn print_qr(url: &str) {
 
 // ── Semantic status helpers ───────────────────────────────────────────────────
 
-/// Print a success status message.
+/// Print a success status message (a milestone). Routed through the leveled
+/// logger: shown in Normal + Verbose, suppressed in Pipe.
 pub fn status(msg: &str) {
-    eprintln!("\x1b[1;32m✓\x1b[0m {msg}");
+    if super::log::is_pipe() {
+        return;
+    }
+    if super::log::stderr_is_tty() {
+        eprintln!("\x1b[1;32m✓\x1b[0m {msg}");
+    } else {
+        eprintln!("✓ {msg}");
+    }
 }
 
-/// Print a warning message.
+/// Print a warning message (a milestone). Suppressed in Pipe.
+#[allow(dead_code)]
 pub fn warn(msg: &str) {
-    eprintln!("\x1b[1;33m⚠\x1b[0m {msg}");
+    if super::log::is_pipe() {
+        return;
+    }
+    if super::log::stderr_is_tty() {
+        eprintln!("\x1b[1;33m⚠\x1b[0m {msg}");
+    } else {
+        eprintln!("⚠ {msg}");
+    }
 }
 
-/// Print inline transfer progress (overwrites current line).
+/// Print inline transfer progress (overwrites current line). Routed through the
+/// logger so it's suppressed in Pipe and avoids ANSI on a non-TTY.
 pub fn transfer_progress(sent: usize, total: usize) {
-    eprint!(
-        "\rSending: {}/{}\x1b[K",
-        super::format_size(sent),
-        super::format_size(total)
-    );
+    super::log::progress_send(sent, total);
 }
 
 /// Print inline receive progress (overwrites current line).
 pub fn receive_progress(received: usize, total: usize) {
-    eprint!(
-        "\rReceiving: {}/{}\x1b[K",
-        super::format_size(received),
-        super::format_size(total)
-    );
+    super::log::progress_recv(received, total);
 }
 
 /// A spinner that runs on a background thread, showing a message with animation.
@@ -190,7 +199,13 @@ pub struct Spinner {
 
 impl Spinner {
     /// Start a spinner with the given message. The spinner runs until dropped.
+    ///
+    /// In Pipe mode (or when stderr isn't a TTY) the animation is suppressed — a
+    /// spinner is meaningless to a machine consumer and would corrupt piped logs.
     pub fn start(msg: &str) -> Self {
+        if super::log::is_pipe() || !super::log::stderr_is_tty() {
+            return Self { stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)), handle: None };
+        }
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_clone = stop.clone();
         let msg = msg.to_owned();

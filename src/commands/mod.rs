@@ -1,5 +1,6 @@
 pub mod display;
 pub mod get;
+pub mod log;
 pub mod manage;
 pub mod p2p_stages;
 pub mod share;

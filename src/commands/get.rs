@@ -4,9 +4,10 @@ use anyhow::{bail, Result};
 
 use crate::api::{ApiClient, P2PVerifyError};
 use crate::crypto::{decrypt_bytes, decrypt_challenge, sha256_bytes, sha256_hex};
-use crate::local_signal::SignalClient;
-use crate::socket::P2PSocket;
 use crate::webrtc::ReceiverPeer;
+use nullseal_p2p_control::control::P2PControl;
+use nullseal_p2p_control::transport::SocketIoTransport;
+use nullseal_socketio::transport::TungsteniteWs;
 
 use super::confirm_unsafe_file;
 
@@ -62,6 +63,7 @@ pub async fn run(
     password: impl Into<String>,
     output_dir: Option<String>,
     server: Option<String>,
+    relay_only: bool,
     log: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let url_or_id = url_or_id.into();
@@ -76,13 +78,13 @@ pub async fn run(
             run_server(&id, &password, output_dir.as_deref(), server.as_deref(), log).await
         }
         ParsedUrl::P2p { id } => {
-            run_p2p(&id, &password, output_dir.as_deref(), server.as_deref(), log).await
+            run_p2p(&id, &password, output_dir.as_deref(), server.as_deref(), relay_only, log).await
         }
         ParsedUrl::BareId { id } => {
             // Try server first; if not found, fall back to P2P
             let result = run_server(&id, &password, output_dir.as_deref(), server.as_deref(), log).await;
             if matches!(&result, Err(e) if e.to_string().contains("not found")) {
-                return run_p2p(&id, &password, output_dir.as_deref(), server.as_deref(), log).await;
+                return run_p2p(&id, &password, output_dir.as_deref(), server.as_deref(), relay_only, log).await;
             }
             result
         }
@@ -101,9 +103,11 @@ async fn run_server(
     let client = ApiClient::new(server_url(server)?);
 
     // Step 1: fetch metadata (includes encrypted challenge + verifyId)
+    super::log::event(&format!("fetching metadata for share {share_id}"));
     let metadata = client.get_share_metadata(share_id).await?;
 
     // Step 2: decrypt challenge to prove password knowledge
+    super::log::event("verifying password (challenge)");
     let answer = decrypt_challenge(
         &metadata.encrypted_challenge,
         &metadata.challenge_metadata,
@@ -112,6 +116,7 @@ async fn run_server(
     .map_err(|_| anyhow::anyhow!("Wrong password or corrupted data"))?;
 
     // Step 3: submit answer to get payload (server auto-consumes one-time shares)
+    super::log::event("fetching encrypted payload");
     let payload = client.get_share_payload(share_id, &answer, &metadata.verify_id).await?;
     let spinner = super::display::Spinner::start("Decrypting…");
     let decrypted = decrypt_bytes(&payload.encrypted_payload, &payload.encryption_metadata, password)
@@ -121,7 +126,7 @@ async fn run_server(
 
     let actual_checksum = sha256_bytes(&decrypted);
     if actual_checksum != payload.content_checksum {
-        eprintln!("\x1b[1;33m⚠\x1b[0m Warning: Content integrity check failed. This share may have been tampered with.");
+        super::display::warn("Content integrity check failed. This share may have been tampered with.");
         if !metadata.one_time_read {
             let _ = client.report_malformed(share_id).await;
         }
@@ -133,7 +138,7 @@ async fn run_server(
             let filepath = super::deduplicate_path(PathBuf::from(dir).join(&fm.filename));
             confirm_unsafe_file(&fm.filename)?;
             std::fs::write(&filepath, &decrypted)?;
-            log(&format!("Saved: {}", filepath.display()));
+            super::log::step(&format!("Saved: {}", filepath.display()));
             return Ok(());
         }
     }
@@ -149,18 +154,21 @@ async fn run_p2p(
     password: &str,
     output_dir: Option<&str>,
     server: Option<&str>,
+    relay_only: bool,
     log: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let base = server_url(server)?;
     let client = ApiClient::new(&base);
 
     // 1. Check session status
+    super::log::event(&format!("joining session {session_id} as recipient"));
     let session = client.get_p2p_session(session_id).await?;
     if session.status == "expired" {
         bail!("Session is expired or unavailable.");
     }
 
     // 2. Verify password
+    super::log::event("verifying password");
     let proof = sha256_hex(password);
     client.verify_p2p_session(session_id, &proof).await.map_err(|e| match e {
         P2PVerifyError::WrongPassword { attempts_left } => {
@@ -176,185 +184,298 @@ async fn run_p2p(
     let ice_servers = client.get_ice_servers().await.unwrap_or_default();
 
     // 4. Connect socket as recipient
-    let (mut socket, mut events) = P2PSocket::connect(&base, session_id, "recipient").await?;
+    let ws_url = TungsteniteWs::build_url(&base)?;
+    super::log::event(&format!("connecting to {ws_url}"));
+    let ws = TungsteniteWs::connect(&ws_url).await?;
+    let (transport, evts) = SocketIoTransport::connect(ws, "p2p").await?;
+    super::log::event("connected (socket)");
+    let mut control = P2PControl::new(transport, evts);
+    control.join(session_id, "recipient")?;
 
     // 5. Wait for joined ack
-    events
+    control.events
         .joined
         .recv()
         .await
         .ok_or_else(|| anyhow::anyhow!("socket closed before joined"))?;
-    log("Connected. Waiting for sender…");
+    super::log::event("joined (recipient)");
+    super::log::step("Connected. Waiting for sender…");
 
-    // 6. Retry loop for WebRTC connection + transfer
-    let policy = &crate::retry::DEFAULT;
-    let mut attempt = 0u32;
-    let mut last_chunk_index: i64 = -1;
-    let mut all_chunks: Vec<String> = Vec::new();
+    // 6. Reconnection driven by the shared `ConnectionMachine` (same pure model as
+    //    the web client, task 001/013). The receiver's resume point comes from the
+    //    sender's metadata (`resumeFromChunk`), so here the machine is purely the
+    //    retry-budget / backoff / Stopped-vs-Expired authority.
+    use crate::p2p::connection::{ConnEvent, ConnPhase, ConnectionMachine};
+    let mut machine = ConnectionMachine::new(
+        crate::retry::DEFAULT.max_retries,
+        crate::retry::DEFAULT.backoff_ms.to_vec(),
+        crate::retry::CHANNEL_TIMEOUT_SECS * 1000,
+    );
+    machine.handle(ConnEvent::Start);
+    machine.handle(ConnEvent::SocketUp);
+    machine.handle(ConnEvent::Joined { last_chunk_offset: 0, generation: 0 });
 
     // Helper: reconnect socket if dead, then emit join
     macro_rules! rejoin {
         () => {{
-            if !socket.is_alive() {
-                let (new_socket, new_events) = P2PSocket::connect(&base, session_id, "recipient").await?;
-                socket = new_socket;
-                events = new_events;
-                events.joined.recv().await
+            if !control.is_alive() {
+                let ws = TungsteniteWs::connect(&ws_url).await?;
+                let (transport, evts) = SocketIoTransport::connect(ws, "p2p").await?;
+                control = P2PControl::new(transport, evts);
+                control.join(session_id, "recipient")?;
+                control.events.joined.recv().await
                     .ok_or_else(|| anyhow::anyhow!("socket closed before joined on reconnect"))?;
             } else {
-                socket.emit_join(session_id, "recipient")?;
+                control.join(session_id, "recipient")?;
+            }
+            // Mark a fresh (re-)join so the machine's retry bookkeeping resets for the
+            // next attempt (mirrors the sender; resets `retry_scheduled`).
+            machine.handle(ConnEvent::Joined { last_chunk_offset: 0, generation: 0 });
+        }};
+    }
+
+    // Drive one failure through the machine: retry-with-backoff vs Stopped (manual
+    // prompt) vs Expired. Caller `rejoin!`s and `continue`s afterward.
+    macro_rules! machine_retry {
+        ($reason:expr, $bail:expr) => {{
+            let acts = machine.handle(ConnEvent::DcClosed);
+            if machine.phase() == ConnPhase::Stopped {
+                if !crate::retry::prompt_manual().await {
+                    bail!($bail);
+                }
+                machine.handle(ConnEvent::ManualRetry);
+            } else {
+                crate::retry::log_retry(
+                    machine.attempts(), crate::retry::DEFAULT.max_retries, $reason,
+                );
+                let delay_ms = crate::commands::p2p_stages::retry_delay_ms(&acts);
+                machine.handle(ConnEvent::RetryTimer);
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
         }};
     }
 
     loop {
-        // 6a. Wait for SDP offer from sender
-        // Drain stale signaling events from previous rounds
-        while events.offer.try_recv().is_ok() {}
-        while events.ice.try_recv().is_ok() {}
+        // 6b. Wait for SDP offer from sender.
+        if machine.attempts() > 0 {
+            while control.events.offer.try_recv().is_ok() {}
+            while control.events.ice.try_recv().is_ok() {}
+        }
 
-        let offer_result = super::p2p_stages::await_offer(&mut events, attempt == 0).await?;
+        let offer_result = super::p2p_stages::await_offer(&mut control.events, machine.attempts() == 0).await?;
 
         let offer = match offer_result {
             Some(o) => o,
             None => {
-                attempt += 1;
-                if policy.exhausted(attempt) {
-                    if !crate::retry::prompt_manual().await {
-                        bail!("Sender did not reconnect after {} retries.", policy.max_retries);
-                    }
-                    attempt = 0;
-                    rejoin!();
-                    continue;
-                }
-                crate::retry::log_retry(attempt, policy.max_retries, "no offer received…");
-                tokio::time::sleep(policy.delay(attempt)).await;
+                machine_retry!(
+                    "no offer received…",
+                    format!("Sender did not reconnect after {} retries.", crate::retry::DEFAULT.max_retries)
+                );
                 rejoin!();
                 continue;
             }
         };
 
         // 7. Create WebRTC receiver peer from offer, send answer back
-        let mut receiver = ReceiverPeer::from_offer(offer, ice_servers.clone(), None).await?;
-        socket.send_answer(receiver.answer_sdp_json()).await?;
+        let mut receiver = if relay_only {
+            ReceiverPeer::from_offer_relay_only(offer, ice_servers.clone(), None).await?
+        } else {
+            ReceiverPeer::from_offer(offer, ice_servers.clone(), None).await?
+        };
+        control.answer(&receiver.answer_sdp_json())?;
 
         // 8. Wait for DataChannel open
-        let channel_open = super::p2p_stages::await_receiver_channel(&mut receiver, &mut events).await?;
+        let channel_open = super::p2p_stages::await_receiver_channel(&mut receiver, &mut control.events).await?;
 
         if !channel_open {
-            attempt += 1;
-            if policy.exhausted(attempt) {
-                if !crate::retry::prompt_manual().await {
-                    bail!("WebRTC connection failed after {} retries.", policy.max_retries);
-                }
-                attempt = 0;
-                rejoin!();
-                continue;
-            }
-            crate::retry::log_retry(attempt, policy.max_retries, "channel open failed…");
-            tokio::time::sleep(policy.delay(attempt)).await;
+            machine_retry!(
+                "channel open failed…",
+                format!("WebRTC connection failed after {} retries.", crate::retry::DEFAULT.max_retries)
+            );
             rejoin!();
             continue;
         }
 
-        // Reset retry counter on successful connection
-        attempt = 0;
+        // DataChannel open → machine resets the retry budget (Transferring phase).
+        machine.handle(ConnEvent::DcOpen);
 
-        log("Transfer started…");
+        super::log::step("Transfer started…");
 
-        // 9. Send resume frame to sender
-        receiver.send_resume(last_chunk_index)?;
+        // 9. Receive v2 binary transfer: wait for metadata string frame, then
+        //    route binary frames through ReceiverAdapter.
+        use crate::crypto::{StreamDecryptor, StreamEncryptionMetadata};
+        use crate::p2p::receiver_adapter::{AdapterOutput, ReceiverAdapter, ReceiverDecryptorT, ReceiverTransport};
+        use crate::p2p::receiver_engine::ReceiverEngine;
+        use sha2::{Digest, Sha256};
 
-        // 10. Collect the full transfer (metadata + chunks + end)
-        let mut round_chunks: Vec<String> = Vec::new();
-        let mut sender_resume_from: usize = 0;
-        let expected_start = if last_chunk_index < 0 { 0usize } else { (last_chunk_index as usize) + 1 };
-        let prior_bytes: usize = all_chunks.iter().map(|c| c.len()).sum();
-        let transfer_result = receiver.receive_transfer(&proof, &|received, total| {
-            let effective = prior_bytes + received;
-            super::display::receive_progress(effective, total);
-        }, &mut round_chunks, &mut sender_resume_from).await;
-
-        // If sender didn't resume from where we expected, it restarted —
-        // discard accumulated chunks to prevent data corruption.
-        if sender_resume_from < expected_start && !all_chunks.is_empty() {
-            eprintln!("\x1b[1;33m⚠\x1b[0m Sender restarted from chunk {sender_resume_from} (expected {expected_start}). Resetting accumulated data.");
-            all_chunks.clear();
-            last_chunk_index = if sender_resume_from == 0 { -1 } else { sender_resume_from as i64 - 1 };
+        struct CtrlTransport<'a, T: nullseal_p2p_control::transport::ControlTransport> {
+            control: &'a P2PControl<T>,
+        }
+        impl<'a, T: nullseal_p2p_control::transport::ControlTransport> ReceiverTransport for CtrlTransport<'a, T> {
+            fn emit_ack(&mut self, through: u64) {
+                let _ = self.control.ack(through);
+            }
+            fn emit_request(&mut self, from: u64) {
+                let _ = self.control.request(from);
+            }
         }
 
-        match transfer_result {
-            Ok(transfer) => {
-                eprintln!();
-                super::display::status("File received");
+        struct RealDecryptor(StreamDecryptor);
+        impl ReceiverDecryptorT for RealDecryptor {
+            fn decrypt_chunk_at(&mut self, ciphertext: &[u8], index: u64) -> anyhow::Result<Vec<u8>> {
+                self.0.decrypt_chunk_at(ciphertext, index)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+            }
+        }
 
-                // Build full payload from prior rounds + this round
-                let full_payload = if all_chunks.is_empty() {
-                    transfer.encrypted_payload
-                } else {
-                    let prior: String = all_chunks.concat();
-                    format!("{}{}", prior, transfer.encrypted_payload)
-                };
+        // Wait for metadata (first text frame from DC) + setup adapter
+        let transfer_result: Result<(Vec<u8>, String, Option<serde_json::Value>, String)> = async {
+            let mut content_type = String::new();
+            let mut file_meta: Option<serde_json::Value> = None;
+            let mut content_checksum_expected = String::new();
+            let mut plaintext_buf: Vec<u8> = Vec::new();
+            let mut hasher = Sha256::new();
+            let mut adapter_opt: Option<ReceiverAdapter<CtrlTransport<'_, _>, RealDecryptor>> = None;
+            let mut total_plaintext_size: usize = 0;
 
-                // 11. Decrypt
-                let spinner = super::display::Spinner::start("Decrypting…");
-                let decrypted = decrypt_bytes(
-                    &full_payload,
-                    &transfer.encryption_metadata,
-                    password,
-                )
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-                drop(spinner);
-                super::display::status(&format!("Decrypted successfully ({})", super::format_size(decrypted.len())));
+            loop {
+                tokio::select! {
+                    biased;
+                    event = receiver.next_event() => {
+                        match event {
+                            Some(crate::webrtc::LoopEvent::Message(text)) => {
+                                // Metadata string frame
+                                let v: serde_json::Value = match serde_json::from_str(&text) {
+                                    Ok(v) => v,
+                                    Err(_) => continue,
+                                };
+                                if v["type"].as_str() == Some("verify") {
+                                    // Verify frame from sender — check proof
+                                    let sender_proof = v["proof"].as_str().unwrap_or("");
+                                    if sender_proof != proof {
+                                        return Err(anyhow::anyhow!("Wrong password."));
+                                    }
+                                    continue;
+                                }
+                                if v["type"].as_str() != Some("metadata") {
+                                    continue;
+                                }
+                                content_type = v["contentType"].as_str().unwrap_or("text").to_owned();
+                                file_meta = if v["fileMetadata"].is_null() { None } else { Some(v["fileMetadata"].clone()) };
+                                content_checksum_expected = v["contentChecksum"].as_str().unwrap_or("").to_owned();
 
-                if let Some(expected) = &transfer.content_checksum {
-                    let actual = sha256_bytes(&decrypted);
-                    if actual != *expected {
-                        super::display::warn("Warning: Content integrity check failed. This share may have been tampered with.");
+                                let stream_meta: StreamEncryptionMetadata = serde_json::from_value(
+                                    v["streamEncryptionMetadata"].clone()
+                                ).map_err(|e| anyhow::anyhow!("invalid stream metadata: {e}"))?;
+
+                                total_plaintext_size = stream_meta.total_plaintext_size as usize;
+                                let resume_from = v["resumeFromChunk"].as_u64().unwrap_or(0);
+                                super::log::event(&format!(
+                                    "metadata received ({content_type}, {}, resume from chunk {resume_from})",
+                                    super::format_size(total_plaintext_size),
+                                ));
+
+                                let mut decryptor = StreamDecryptor::from_metadata(&stream_meta, password)
+                                    .map_err(|e| anyhow::anyhow!("failed to init decryptor: {e}"))?;
+                                if resume_from > 0 {
+                                    decryptor.skip_to(resume_from);
+                                }
+
+                                let engine = ReceiverEngine::new(64, 250, 5000, resume_from);
+                                let transport = CtrlTransport { control: &control };
+                                adapter_opt = Some(ReceiverAdapter::new(engine, RealDecryptor(decryptor), transport));
+                            }
+                            Some(crate::webrtc::LoopEvent::BinaryData(data)) => {
+                                // Binary chunk/end frame → feed to adapter
+                                if let Some(ref mut adapter) = adapter_opt {
+                                    let now = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as u64;
+                                    let outputs = adapter.on_frame(&data, now);
+                                    for out in outputs {
+                                        match out {
+                                            AdapterOutput::Deliver { index, plaintext } => {
+                                                hasher.update(&plaintext);
+                                                plaintext_buf.extend_from_slice(&plaintext);
+                                                super::log::event(&format!(
+                                                    "received chunk {index} ({}) — {} / {}",
+                                                    super::format_size(plaintext.len()),
+                                                    super::format_size(plaintext_buf.len()),
+                                                    super::format_size(total_plaintext_size),
+                                                ));
+                                                super::display::receive_progress(plaintext_buf.len(), total_plaintext_size);
+                                            }
+                                            AdapterOutput::Complete => {
+                                                // Verify checksum
+                                                let computed = format!("{:x}", hasher.clone().finalize());
+                                                if !content_checksum_expected.is_empty() && computed != content_checksum_expected {
+                                                    return Err(anyhow::anyhow!(
+                                                        "Checksum mismatch: expected {content_checksum_expected}, got {computed}"
+                                                    ));
+                                                }
+                                                return Ok((plaintext_buf, content_type, file_meta, computed));
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                            Some(crate::webrtc::LoopEvent::Error(e)) => {
+                                return Err(anyhow::anyhow!("WebRTC error: {e}"));
+                            }
+                            Some(crate::webrtc::LoopEvent::Done) | None => {
+                                return Err(anyhow::anyhow!("DataChannel closed before transfer complete"));
+                            }
+                            _ => {}
+                        }
                     }
                 }
+            }
+        }.await;
 
-                // 12. Output
-                if transfer.content_type == "file" {
-                    if let Some(fm) = &transfer.file_metadata {
+        match transfer_result {
+            Ok((plaintext, content_type, file_meta, checksum)) => {
+                super::log::blank();
+                super::display::status(&format!(
+                    "Received & decrypted ({})",
+                    super::format_size(plaintext.len())
+                ));
+
+                // 10. Output
+                if content_type == "file" {
+                    if let Some(fm) = &file_meta {
                         let filename = fm["filename"]
                             .as_str()
                             .unwrap_or("received_file");
                         let dir = output_dir.unwrap_or(".");
                         let filepath = super::deduplicate_path(PathBuf::from(dir).join(filename));
                         confirm_unsafe_file(filename)?;
-                        std::fs::write(&filepath, &decrypted)?;
-                        log(&format!("Saved: {}", filepath.display()));
+                        std::fs::write(&filepath, &plaintext)?;
+                        super::log::step(&format!("Saved: {}", filepath.display()));
                     } else {
-                        log(std::str::from_utf8(&decrypted).unwrap_or("(binary data)"));
+                        log(std::str::from_utf8(&plaintext).unwrap_or("(binary data)"));
                     }
                 } else {
-                    log(std::str::from_utf8(&decrypted).unwrap_or("(binary data)"));
+                    log(std::str::from_utf8(&plaintext).unwrap_or("(binary data)"));
                 }
 
-                // 13. Cleanup
+                // 11. Emit complete + wait for session deletion, then cleanup
                 receiver.close();
-                socket.disconnect().await?;
+                let _ = control.complete("recipient", &checksum);
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    control.events.deleted.recv(),
+                ).await;
                 return Ok(());
             }
             Err(e) => {
-                eprintln!();
-                // Save partial chunks for resume on next attempt
-                last_chunk_index += round_chunks.len() as i64;
-                all_chunks.extend(round_chunks);
-
-                // Transfer interrupted — retry if possible
-                attempt += 1;
-                if policy.exhausted(attempt) {
-                    if !crate::retry::prompt_manual().await {
-                        bail!("Transfer failed after {} retries: {e}", policy.max_retries);
-                    }
-                    attempt = 0;
-                    rejoin!();
-                    continue;
-                }
-                crate::retry::log_retry(attempt, policy.max_retries, &format!("transfer interrupted: {e}"));
-                tokio::time::sleep(policy.delay(attempt)).await;
+                super::log::blank();
+                // Transfer interrupted — machine decides retry vs stop.
+                machine_retry!(
+                    &format!("transfer interrupted: {e}"),
+                    format!("Transfer failed after {} retries: {e}", crate::retry::DEFAULT.max_retries)
+                );
                 rejoin!();
                 continue;
             }
@@ -364,7 +485,8 @@ async fn run_p2p(
 
 // ── Local mode (no server) ────────────────────────────────────────────────────
 
-/// Fully local receive — connects to sender's TCP signaling server, does WebRTC locally.
+/// Fully local receive — discovers sender via mDNS, connects to the embedded
+/// Socket.IO server via crate B, and runs the same flow as run_p2p (windowed-ACK v2).
 pub async fn run_local(
     password: impl Into<String>,
     output_dir: Option<String>,
@@ -378,101 +500,295 @@ pub async fn run_local(
 
     let proof = sha256_hex(&password);
 
-    // 1. Resolve sender address
+    // 1. Resolve sender address (via mDNS or explicit)
     let addr = match ip {
         Some(a) => {
-            eprintln!("\x1b[1;34m📡\x1b[0m Connecting to {a}…");
+            super::log::step(&format!("📡 Connecting to {a}…"));
             a
         }
         None => crate::local::discover_addr(std::time::Duration::from_secs(30))?,
     };
 
-    // 2. Connect to sender's signaling server
-    let mut signal = SignalClient::connect(&addr).await?;
-    log("Connected to sender.");
+    // 2. Connect to sender's embedded Socket.IO server via crate B
+    let ws_url = format!("ws://{addr}/socket.io/?EIO=4&transport=websocket");
+    let ws = TungsteniteWs::connect(&ws_url).await?;
+    let (transport, evts) = SocketIoTransport::connect(ws, "p2p").await?;
+    let mut control = P2PControl::new(transport, evts);
 
-    // 3. Wait for offer
-    let msg = signal.recv_or_bail().await?;
-    let offer = match msg["type"].as_str() {
-        Some("offer") => msg,
-        _ => bail!("expected offer, got: {}", msg["type"]),
-    };
+    // 3. Join as recipient
+    control.join("local", "recipient")?;
+    control.events.joined.recv().await
+        .ok_or_else(|| anyhow::anyhow!("socket closed before joined"))?;
+    super::log::step("Connected. Waiting for sender…");
 
-    // 4. Create WebRTC receiver peer from offer, send answer back
     let bind_ip: Option<std::net::IpAddr> = addr.split(':')
         .next()
         .and_then(|h| h.parse().ok());
-    let mut receiver = ReceiverPeer::from_offer(offer, vec![], bind_ip).await?;
-    signal.send_answer(receiver.answer_sdp_json()).await?;
 
-    // 5. Wait for DataChannel open (with timeout)
-    let channel_open = tokio::time::timeout(
-        std::time::Duration::from_secs(crate::retry::CHANNEL_TIMEOUT_SECS),
-        async {
+    // Shared receive types (sha256_bytes is already in module scope)
+    use crate::crypto::{StreamDecryptor, StreamEncryptionMetadata};
+    use crate::p2p::receiver_adapter::{AdapterOutput, ReceiverAdapter, ReceiverDecryptorT, ReceiverTransport};
+    use crate::p2p::receiver_engine::ReceiverEngine;
+
+    struct CtrlTransport<'a, T: nullseal_p2p_control::transport::ControlTransport> {
+        control: &'a P2PControl<T>,
+    }
+    impl<'a, T: nullseal_p2p_control::transport::ControlTransport> ReceiverTransport for CtrlTransport<'a, T> {
+        fn emit_ack(&mut self, through: u64) {
+            let _ = self.control.ack(through);
+        }
+        fn emit_request(&mut self, from: u64) {
+            let _ = self.control.request(from);
+        }
+    }
+
+    struct RealDecryptor(StreamDecryptor);
+    impl ReceiverDecryptorT for RealDecryptor {
+        fn decrypt_chunk_at(&mut self, ciphertext: &[u8], index: u64) -> anyhow::Result<Vec<u8>> {
+            self.0.decrypt_chunk_at(ciphertext, index)
+                .map_err(|e| anyhow::anyhow!("{e}"))
+        }
+    }
+
+    // 4. Reconnection driven by the shared `ConnectionMachine` (task 013). Local mode
+    //    has no manual prompt, so `Stopped` → bail. The receiver's resume comes from
+    //    the sender's metadata (`resumeFromChunk`) + the preserved plaintext buffer;
+    //    the machine is the retry-budget / backoff authority.
+    use crate::p2p::connection::{ConnEvent, ConnPhase, ConnectionMachine};
+    let mut machine = ConnectionMachine::new(
+        crate::retry::DEFAULT.max_retries,
+        crate::retry::DEFAULT.backoff_ms.to_vec(),
+        crate::retry::CHANNEL_TIMEOUT_SECS * 1000,
+    );
+    machine.handle(ConnEvent::Start);
+    machine.handle(ConnEvent::SocketUp);
+    machine.handle(ConnEvent::Joined { last_chunk_offset: 0, generation: 0 });
+    let chunk_size = crate::crypto::STREAM_CHUNK_SIZE;
+
+    // Preserved across reconnects so we resume instead of restarting.
+    let mut plaintext_buf: Vec<u8> = Vec::new();
+    let mut content_type = String::new();
+    let mut file_meta: Option<serde_json::Value> = None;
+
+    macro_rules! rejoin {
+        () => {{
+            super::p2p_stages::drain(&mut control.events.offer);
+            super::p2p_stages::drain(&mut control.events.ice);
+            super::p2p_stages::drain(&mut control.events.both_ready);
+            if !control.is_alive() {
+                let ws = TungsteniteWs::connect(&ws_url).await?;
+                let (transport, evts) = SocketIoTransport::connect(ws, "p2p").await?;
+                control = P2PControl::new(transport, evts);
+                control.join("local", "recipient")?;
+                control.events.joined.recv().await
+                    .ok_or_else(|| anyhow::anyhow!("socket closed before joined on reconnect"))?;
+            } else {
+                control.join("local", "recipient")?;
+            }
+            machine.handle(ConnEvent::Joined { last_chunk_offset: 0, generation: 0 });
+        }};
+    }
+
+    // Local has no manual-retry prompt: the machine's `Stopped` → bail directly.
+    macro_rules! machine_retry {
+        ($reason:expr, $bail:expr) => {{
+            let acts = machine.handle(ConnEvent::DcClosed);
+            if machine.phase() == ConnPhase::Stopped {
+                bail!($bail);
+            }
+            crate::retry::log_retry(
+                machine.attempts(), crate::retry::DEFAULT.max_retries, $reason,
+            );
+            let delay_ms = crate::commands::p2p_stages::retry_delay_ms(&acts);
+            machine.handle(ConnEvent::RetryTimer);
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }};
+    }
+
+    let checksum = loop {
+        // 5. Wait for the sender's offer. (Stale offer/ice are drained inside rejoin!
+        //    BEFORE re-joining, so a fresh offer relayed right after both-ready over
+        //    loopback isn't accidentally discarded here.)
+        let offer = match super::p2p_stages::await_offer(&mut control.events, machine.attempts() == 0).await? {
+            Some(o) => o,
+            None => {
+                machine_retry!(
+                    "no offer received…",
+                    format!("Sender did not reconnect after {} retries.", crate::retry::DEFAULT.max_retries)
+                );
+                rejoin!();
+                continue;
+            }
+        };
+
+        // 6. Build receiver from offer, answer, await DataChannel.
+        let sdp_val = &offer["sdp"];
+        let offer_val = serde_json::json!({"type": "offer", "sdp": sdp_val});
+        let mut receiver = ReceiverPeer::from_offer(offer_val, vec![], bind_ip).await?;
+        control.answer(&receiver.answer_sdp_json())?;
+
+        let channel_open = super::p2p_stages::await_receiver_channel(&mut receiver, &mut control.events).await?;
+        if !channel_open {
+            machine_retry!(
+                "channel open failed…",
+                format!("DataChannel open failed after {} retries.", crate::retry::DEFAULT.max_retries)
+            );
+            rejoin!();
+            continue;
+        }
+        machine.handle(ConnEvent::DcOpen);
+        super::log::step("Transfer started…");
+
+        // 7. Receive v2 binary transfer with windowed-ACK control plane. The
+        //    plaintext we've already committed is kept; on (re)connect we truncate
+        //    to the sender's resume point and decrypt forward from there.
+        let transfer_result: Result<String> = async {
+            let mut content_checksum_expected = String::new();
+            let mut adapter_opt: Option<ReceiverAdapter<CtrlTransport<'_, _>, RealDecryptor>> = None;
+            let mut total_plaintext_size: usize = 0;
+
             loop {
                 match receiver.next_event().await {
-                    Some(crate::webrtc::LoopEvent::ChannelOpen) => return Ok::<(), anyhow::Error>(()),
-                    Some(crate::webrtc::LoopEvent::Error(e)) => bail!("WebRTC error: {e}"),
-                    Some(crate::webrtc::LoopEvent::Done) | None => bail!("WebRTC closed before transfer"),
+                    Some(crate::webrtc::LoopEvent::Message(text)) => {
+                        let v: serde_json::Value = match serde_json::from_str(&text) {
+                            Ok(v) => v,
+                            Err(_) => continue,
+                        };
+                        if v["type"].as_str() == Some("verify") {
+                            let sender_proof = v["proof"].as_str().unwrap_or("");
+                            if sender_proof != proof {
+                                return Err(anyhow::anyhow!("Wrong password."));
+                            }
+                            continue;
+                        }
+                        if v["type"].as_str() != Some("metadata") {
+                            continue;
+                        }
+                        content_type = v["contentType"].as_str().unwrap_or("text").to_owned();
+                        file_meta = if v["fileMetadata"].is_null() { None } else { Some(v["fileMetadata"].clone()) };
+                        content_checksum_expected = v["contentChecksum"].as_str().unwrap_or("").to_owned();
+
+                        let stream_meta: StreamEncryptionMetadata = serde_json::from_value(
+                            v["streamEncryptionMetadata"].clone()
+                        ).map_err(|e| anyhow::anyhow!("invalid stream metadata: {e}"))?;
+
+                        total_plaintext_size = stream_meta.total_plaintext_size as usize;
+                        let resume_from = v["resumeFromChunk"].as_u64().unwrap_or(0);
+                        super::log::event(&format!(
+                            "metadata received ({content_type}, {}, resume from chunk {resume_from})",
+                            super::format_size(total_plaintext_size),
+                        ));
+
+                        // Truncate any committed plaintext to the sender's resume point
+                        // (mirrors the web recipient's `slice(0, resumeFrom)`), so a
+                        // re-sent chunk isn't double-counted.
+                        let keep = (resume_from as usize)
+                            .saturating_mul(chunk_size)
+                            .min(plaintext_buf.len());
+                        plaintext_buf.truncate(keep);
+
+                        let mut decryptor = StreamDecryptor::from_metadata(&stream_meta, &password)
+                            .map_err(|e| anyhow::anyhow!("failed to init decryptor: {e}"))?;
+                        if resume_from > 0 {
+                            decryptor.skip_to(resume_from);
+                        }
+
+                        let engine = ReceiverEngine::new(64, 250, 5000, resume_from);
+                        let transport = CtrlTransport { control: &control };
+                        adapter_opt = Some(ReceiverAdapter::new(engine, RealDecryptor(decryptor), transport));
+                    }
+                    Some(crate::webrtc::LoopEvent::BinaryData(data)) => {
+                        if let Some(ref mut adapter) = adapter_opt {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            let outputs = adapter.on_frame(&data, now);
+                            for out in outputs {
+                                match out {
+                                    AdapterOutput::Deliver { index, plaintext } => {
+                                        plaintext_buf.extend_from_slice(&plaintext);
+                                        super::log::event(&format!(
+                                            "received chunk {index} ({}) — {} / {}",
+                                            super::format_size(plaintext.len()),
+                                            super::format_size(plaintext_buf.len()),
+                                            super::format_size(total_plaintext_size),
+                                        ));
+                                        super::display::receive_progress(plaintext_buf.len(), total_plaintext_size);
+                                    }
+                                    AdapterOutput::Complete => {
+                                        // Hash the fully assembled buffer (resume-safe;
+                                        // chunks may have been re-sent on reconnect).
+                                        let computed = sha256_bytes(&plaintext_buf);
+                                        if !content_checksum_expected.is_empty() && computed != content_checksum_expected {
+                                            return Err(anyhow::anyhow!(
+                                                "Checksum mismatch: expected {content_checksum_expected}, got {computed}"
+                                            ));
+                                        }
+                                        return Ok(computed);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    Some(crate::webrtc::LoopEvent::Error(e)) => {
+                        return Err(anyhow::anyhow!("WebRTC error: {e}"));
+                    }
+                    Some(crate::webrtc::LoopEvent::Done) | None => {
+                        return Err(anyhow::anyhow!("DataChannel closed before transfer complete"));
+                    }
                     _ => {}
                 }
             }
-        },
-    )
-    .await;
-    match channel_open {
-        Ok(Ok(())) => log("Transfer started…"),
-        Ok(Err(e)) => return Err(e),
-        Err(_) => bail!("DataChannel open timed out"),
-    }
+        }.await;
 
-    // 6. Receive transfer (verify + metadata + chunks + end)
-    let mut chunks: Vec<String> = Vec::new();
-    let mut _local_resume_from: usize = 0;
-    let transfer = receiver.receive_transfer(&proof, &|received, total| {
-        eprint!("\rReceiving: {}/{}\x1b[K", super::format_size(received), super::format_size(total));
-    }, &mut chunks, &mut _local_resume_from).await?;
-    eprintln!();
-    super::display::status("File received");
-
-    // 7. Decrypt
-    let spinner = super::display::Spinner::start("Decrypting…");
-    let decrypted = decrypt_bytes(
-        &transfer.encrypted_payload,
-        &transfer.encryption_metadata,
-        &password,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    drop(spinner);
-    super::display::status("Decrypted successfully");
-
-    if let Some(expected) = &transfer.content_checksum {
-        let actual = sha256_bytes(&decrypted);
-        if actual != *expected {
-            eprintln!("\x1b[1;33m⚠\x1b[0m Warning: Content integrity check failed. This share may have been tampered with.");
+        match transfer_result {
+            Ok(checksum) => {
+                receiver.close();
+                break checksum;
+            }
+            Err(e) => {
+                super::log::blank();
+                receiver.close();
+                machine_retry!(
+                    &format!("transfer interrupted: {e}"),
+                    format!("Transfer failed after {} retries: {e}", crate::retry::DEFAULT.max_retries)
+                );
+                rejoin!();
+                continue;
+            }
         }
-    }
+    };
 
-    // 8. Output
-    if transfer.content_type == "file" {
-        if let Some(fm) = &transfer.file_metadata {
-            let filename = fm["filename"]
-                .as_str()
-                .unwrap_or("received_file");
+    // 8. Output the assembled plaintext.
+    super::log::blank();
+    super::display::status(&format!(
+        "Received & decrypted ({})",
+        super::format_size(plaintext_buf.len())
+    ));
+    if content_type == "file" {
+        if let Some(fm) = &file_meta {
+            let filename = fm["filename"].as_str().unwrap_or("received_file");
             let dir = output_dir.as_deref().unwrap_or(".");
             let filepath = super::deduplicate_path(PathBuf::from(dir).join(filename));
             confirm_unsafe_file(filename)?;
-            std::fs::write(&filepath, &decrypted)?;
-            log(&format!("Saved: {}", filepath.display()));
+            std::fs::write(&filepath, &plaintext_buf)?;
+            super::log::step(&format!("Saved: {}", filepath.display()));
         } else {
-            log(std::str::from_utf8(&decrypted).unwrap_or("(binary data)"));
+            log(std::str::from_utf8(&plaintext_buf).unwrap_or("(binary data)"));
         }
     } else {
-        log(std::str::from_utf8(&decrypted).unwrap_or("(binary data)"));
+        log(std::str::from_utf8(&plaintext_buf).unwrap_or("(binary data)"));
     }
 
-    // 9. Cleanup
-    receiver.close();
+    // 9. Emit complete + wait for the sender to finish (deleted), then cleanup.
+    //    (011 clean-completion handshake — keeps the sender exiting 0.)
+    let _ = control.complete("recipient", &checksum);
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        control.events.deleted.recv(),
+    ).await;
     Ok(())
 }
 
@@ -628,7 +944,7 @@ mod tests {
         mount_text_share(&server, "abc123", b"top secret", "mypassword").await;
 
         let mut logged = String::new();
-        run("https://example.com/s/abc123", "mypassword", None, Some(url), &mut |s| {
+        run("https://example.com/s/abc123", "mypassword", None, Some(url), false, &mut |s| {
             logged = s.to_owned()
         })
         .await
@@ -643,7 +959,7 @@ mod tests {
         // Encrypt challenge with "correctpass" — client will try "wrongpass" and fail locally
         mount_text_share(&server, "abc", b"secret", "correctpass").await;
 
-        let err = run("https://example.com/s/abc", "wrongpass", None, Some(url), &mut |_| {})
+        let err = run("https://example.com/s/abc", "wrongpass", None, Some(url), false, &mut |_| {})
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -663,7 +979,7 @@ mod tests {
         mount_file_share(&server, "fid", content, password, "data.zip").await;
 
         let dir = tmp.path().to_str().unwrap().to_owned();
-        run("https://example.com/s/fid", password, Some(dir.clone()), Some(url), &mut |_| {})
+        run("https://example.com/s/fid", password, Some(dir.clone()), Some(url), false, &mut |_| {})
             .await
             .unwrap();
 
@@ -682,7 +998,7 @@ mod tests {
         mount_file_share(&server, "dup", content, password, "data.zip").await;
 
         let dir = tmp.path().to_str().unwrap().to_owned();
-        run("https://example.com/s/dup", password, Some(dir.clone()), Some(url), &mut |_| {})
+        run("https://example.com/s/dup", password, Some(dir.clone()), Some(url), false, &mut |_| {})
             .await
             .unwrap();
 
@@ -704,7 +1020,7 @@ mod tests {
         mount_file_share(&server, "file1", content, password, "doc.zip").await;
 
         let dir = tmp.path().to_str().unwrap().to_owned();
-        run("https://example.com/s/file1", password, Some(dir.clone()), Some(url), &mut |_| {})
+        run("https://example.com/s/file1", password, Some(dir.clone()), Some(url), false, &mut |_| {})
             .await
             .unwrap();
 
@@ -723,7 +1039,7 @@ mod tests {
 
         // Use full URL so it's parsed as explicit server mode (no P2P fallback)
         let share_url = format!("{}/s/gone", url);
-        let err = run(share_url, "password", None, Some(url), &mut |_| {})
+        let err = run(share_url, "password", None, Some(url), false, &mut |_| {})
             .await
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("not found") || err.to_string().to_lowercase().contains("unavailable"));
@@ -731,7 +1047,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_short_password() {
-        let err = run("abc123", "ab", None, None, &mut |_| {}).await.unwrap_err();
+        let err = run("abc123", "ab", None, None, false, &mut |_| {}).await.unwrap_err();
         assert!(err.to_string().contains("Password"));
     }
 
@@ -748,7 +1064,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run("https://nullseal.com/p2p/s1", "password", None, Some(url), &mut |_| {})
+        let err = run("https://nullseal.com/p2p/s1", "password", None, Some(url), false, &mut |_| {})
             .await
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("expired"));
@@ -772,7 +1088,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run("https://nullseal.com/p2p/s2", "password", None, Some(url), &mut |_| {})
+        let err = run("https://nullseal.com/p2p/s2", "password", None, Some(url), false, &mut |_| {})
             .await
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("wrong password"));
@@ -843,7 +1159,7 @@ mod tests {
         mount_file_share(&server, "fid2", content, password, "test.pdf").await;
 
         let dir = tmp.path().to_str().unwrap().to_owned();
-        run("s/fid2", password, Some(dir.clone()), Some(url), &mut |_| {})
+        run("s/fid2", password, Some(dir.clone()), Some(url), false, &mut |_| {})
             .await
             .unwrap();
 

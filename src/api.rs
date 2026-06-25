@@ -150,6 +150,8 @@ pub struct P2PSession {
 #[allow(dead_code)]
 pub struct IceServer {
     pub urls: serde_json::Value,
+    pub username: Option<String>,
+    pub credential: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
