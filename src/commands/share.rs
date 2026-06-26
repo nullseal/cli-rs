@@ -4,9 +4,10 @@ use anyhow::{bail, Result};
 
 use crate::api::{ApiClient, CreateShareRequest, FileMetadata};
 use crate::crypto::{encrypt_bytes, generate_challenge, sha256_hex};
-use crate::local_signal::SignalServer;
-use crate::socket::P2PSocket;
 use crate::webrtc::SenderPeer;
+use nullseal_p2p_control::control::P2PControl;
+use nullseal_p2p_control::transport::SocketIoTransport;
+use nullseal_socketio::transport::TungsteniteWs;
 
 const MIN_PASSWORD_LEN: usize = 3;
 const SERVER_MAX_BYTES: u64 = 2 * 1024 * 1024; // 2 MB
@@ -108,15 +109,17 @@ pub async fn run(
     server: Option<String>,
     ttl: Option<String>,
     one_time: bool,
+    relay_only: bool,
     output: &mut dyn FnMut(&str),
 ) -> Result<()> {
-    run_inner(content, password, mode, content_type_flag, server, false, ttl, one_time, output).await
+    run_inner(content, password, mode, content_type_flag, server, false, ttl, one_time, relay_only, output).await
 }
 
 
 
 /// Fully local transfer — no server needed.
-/// Sender binds a TCP signaling server, does WebRTC locally.
+/// Host starts an embedded Socket.IO relay, advertises via mDNS, connects as
+/// sender via crate B, and runs the same flow as run_p2p (windowed-ACK v2).
 pub async fn run_local(
     content: impl Into<String>,
     password: impl Into<String>,
@@ -134,105 +137,403 @@ pub async fn run_local(
     let content_type = resolve_content_type(&content_type_flag);
     let ReadInput { bytes, file_metadata } = read_input(&content, content_type)?;
 
-    // 1. Encrypt + derive password proof
-    let spinner = super::display::Spinner::start(
-        &format!("Encrypting {} …", super::format_size(bytes.len())),
-    );
+    // 1. Derive password proof + checksum
     let content_checksum = crate::crypto::sha256_bytes(&bytes);
-    let result = encrypt_bytes(&bytes, &password);
     let proof = sha256_hex(&password);
-    drop(spinner);
 
-    // 2. Parse bind address and bind TCP signaling server
-    let (local_ip, explicit_port) = match &bind_addr {
-        Some(a) if a.contains(':') => {
-            let mut parts = a.rsplitn(2, ':');
-            let port: u16 = parts.next().unwrap().parse()
-                .map_err(|_| anyhow::anyhow!("invalid port in address: {a}"))?;
-            let ip = parts.next().unwrap().to_string();
-            (ip, Some(port))
-        }
-        Some(ip) => (ip.clone(), None),
-        None => (crate::webrtc::discover_local_ip().to_string(), None),
+    // 2. Parse bind address
+    let local_ip = match &bind_addr {
+        Some(a) if a.contains(':') => a.rsplitn(2, ':').last().unwrap().to_string(),
+        Some(ip) => ip.clone(),
+        None => crate::webrtc::discover_local_ip().to_string(),
     };
-    let signal_server = if let Some(port) = explicit_port {
-        SignalServer::bind_addr(&format!("{local_ip}:{port}")).await?
-    } else {
-        match SignalServer::bind_to(&local_ip).await {
-            Ok(s) => s,
-            Err(_) => SignalServer::bind().await?,
-        }
-    };
-    let port = signal_server.port();
-    let addr = format!("{local_ip}:{port}");
 
-    // 3. Display local share info
-    super::display::print_local_share_result(&addr);
+    // 3. Start embedded Socket.IO server
+    let (addr, _server_handle) = crate::local_server::start(&local_ip).await?;
+    let port = addr.port();
 
-    // 4. Broadcast via mDNS
+    // 4. Display + broadcast via mDNS
+    super::display::print_local_share_result(&format!("{local_ip}:{port}"));
     let _broadcast_guard = crate::local::broadcast_addr(&local_ip, port)?;
 
-    // 5. Wait for receiver to connect
-    let mut signal = signal_server.accept().await?;
-    eprintln!("\x1b[1;32m✓\x1b[0m Recipient connected. Starting transfer…");
+    // 5. Connect to own server as sender via crate B
+    let ws_url = format!("ws://{local_ip}:{port}/socket.io/?EIO=4&transport=websocket");
+    let ws = nullseal_socketio::transport::TungsteniteWs::connect(&ws_url).await?;
+    let (transport, evts) = SocketIoTransport::connect(ws, "p2p").await?;
+    let mut control = P2PControl::new(transport, evts);
 
-    // 6. Create WebRTC sender peer + offer
+    // 6. Join as sender; capture the relay's resume checkpoint. (BUG-10 parity)
+    control.join("local", "sender")?;
+    let mut last_chunk_offset: u64 = {
+        let j = control.events.joined.recv().await
+            .ok_or_else(|| anyhow::anyhow!("socket closed before joined"))?;
+        j.get("lastChunkOffset").and_then(|v| v.as_u64()).unwrap_or(0)
+    };
+    super::log::step("📡 Waiting for recipient…");
+
     let bind_ip: Option<std::net::IpAddr> = local_ip.parse().ok();
-    let mut sender = SenderPeer::new(vec![], bind_ip).await?;
-    signal.send_offer(sender.offer_sdp_json()).await?;
+    let chunk_size = crate::crypto::STREAM_CHUNK_SIZE;
+    let total_bytes = bytes.len();
 
-    // 7. Wait for answer
-    let msg = signal.recv_or_bail().await?;
-    match msg["type"].as_str() {
-        Some("answer") => {
-            sender.handle_answer(msg.clone())?;
+    let meta_extra = serde_json::json!({
+        "contentType": content_type,
+        "fileMetadata": file_metadata.as_ref().map(|fm| serde_json::to_value(fm).unwrap()),
+        "contentChecksum": &content_checksum,
+    });
+
+    use crate::p2p::sender_adapter::{SenderAdapter, SenderCipherT, SenderTransport};
+    use crate::p2p::sender_engine::SenderEngine;
+
+    struct LocalCipher(crate::crypto::StreamCipher);
+    impl SenderCipherT for LocalCipher {
+        fn metadata(&self) -> serde_json::Value {
+            serde_json::to_value(self.0.metadata()).unwrap()
         }
-        _ => bail!("expected answer, got: {}", msg["type"]),
+        fn chunk_index(&self) -> u64 { self.0.chunk_index() }
+        fn skip_to(&mut self, index: u64) { self.0.skip_to(index); }
+        fn encrypt_chunk(&mut self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+            self.0.encrypt_chunk(plaintext).map_err(|e| anyhow::anyhow!("{e}"))
+        }
     }
 
-    // 8. Wait for DataChannel open (with timeout)
-    let channel_open = tokio::time::timeout(
-        std::time::Duration::from_secs(crate::retry::CHANNEL_TIMEOUT_SECS),
-        async {
+    struct BufTransport {
+        text_queue: Vec<String>,
+        binary_queue: Vec<Vec<u8>>,
+    }
+    impl SenderTransport for BufTransport {
+        fn send_text(&mut self, s: String) { self.text_queue.push(s); }
+        fn send_binary(&mut self, b: Vec<u8>) { self.binary_queue.push(b); }
+    }
+
+    // Test-only mid-transfer drop injection (CLI analog of the web test's PC-close):
+    // when NULLSEAL_TEST_DROP_AFTER_BYTES is set, force one DC drop after that many
+    // bytes so the rejoin/resume path runs deterministically. Inert in production.
+    let test_drop_after: Option<u64> = std::env::var("NULLSEAL_TEST_DROP_AFTER_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let mut test_drop_armed = test_drop_after.is_some();
+
+    // 7. Reconnection driven by the shared `ConnectionMachine` (same pure model as
+    //    online/web, task 013). Local mode has no interactive prompt, so on the
+    //    machine's `Stopped` we bail directly. Resume point is the relay checkpoint
+    //    (`last_chunk_offset`). (BUG-9/10)
+    use crate::p2p::connection::{ConnEvent, ConnPhase, ConnectionMachine};
+    let mut machine = ConnectionMachine::new(
+        crate::retry::DEFAULT.max_retries,
+        crate::retry::DEFAULT.backoff_ms.to_vec(),
+        crate::retry::CHANNEL_TIMEOUT_SECS * 1000,
+    );
+    machine.handle(ConnEvent::Start);
+    machine.handle(ConnEvent::SocketUp);
+    machine.handle(ConnEvent::Joined { last_chunk_offset, generation: 0 });
+
+    macro_rules! rejoin {
+        () => {{
+            super::p2p_stages::drain(&mut control.events.both_ready);
+            super::p2p_stages::drain(&mut control.events.answer);
+            super::p2p_stages::drain(&mut control.events.ice);
+            super::p2p_stages::drain(&mut control.events.error);
+            if !control.is_alive() {
+                let ws = nullseal_socketio::transport::TungsteniteWs::connect(&ws_url).await?;
+                let (transport, evts) = SocketIoTransport::connect(ws, "p2p").await?;
+                control = P2PControl::new(transport, evts);
+                control.join("local", "sender")?;
+                let j = control.events.joined.recv().await
+                    .ok_or_else(|| anyhow::anyhow!("socket closed before joined on reconnect"))?;
+                last_chunk_offset = j.get("lastChunkOffset").and_then(|v| v.as_u64()).unwrap_or(last_chunk_offset);
+                machine.handle(ConnEvent::Joined { last_chunk_offset, generation: 0 });
+            } else {
+                control.join("local", "sender")?;
+                if let Some(j) = control.events.joined.recv().await {
+                    last_chunk_offset = j.get("lastChunkOffset").and_then(|v| v.as_u64()).unwrap_or(last_chunk_offset);
+                }
+                machine.handle(ConnEvent::Joined { last_chunk_offset, generation: 0 });
+            }
+        }};
+    }
+
+    // Local has no manual-retry prompt: the machine's `Stopped` → bail directly.
+    macro_rules! machine_retry {
+        ($reason:expr, $bail:expr) => {{
+            let acts = machine.handle(ConnEvent::DcClosed);
+            if machine.phase() == ConnPhase::Stopped {
+                bail!($bail);
+            }
+            crate::retry::log_retry(
+                machine.attempts(), crate::retry::DEFAULT.max_retries, $reason,
+            );
+            let delay_ms = crate::commands::p2p_stages::retry_delay_ms(&acts);
+            machine.handle(ConnEvent::RetryTimer);
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }};
+    }
+
+    loop {
+        // 7a. Wait for the recipient to (re)join.
+        let got_ready = super::p2p_stages::await_ready(&mut control.events, machine.attempts() == 0).await?;
+        if !got_ready {
+            machine_retry!(
+                "recipient not ready…",
+                format!("Recipient did not rejoin after {} retries.", crate::retry::DEFAULT.max_retries)
+            );
+            rejoin!();
+            continue;
+        }
+        super::display::status("Recipient connected. Starting transfer…");
+
+        // 7b. Fresh WebRTC sender peer + offer (no ICE servers for LAN).
+        while control.events.answer.try_recv().is_ok() {}
+        while control.events.ice.try_recv().is_ok() {}
+        let mut sender = SenderPeer::new(vec![], bind_ip).await?;
+        control.offer(&sender.offer_sdp_json())?;
+        super::p2p_stages::await_answer(&sender, &mut control.events).await?;
+        let channel_open = super::p2p_stages::await_sender_channel(&mut sender, &mut control.events).await?;
+        if !channel_open {
+            machine_retry!(
+                "channel open failed…",
+                format!("DataChannel open failed after {} retries.", crate::retry::DEFAULT.max_retries)
+            );
+            rejoin!();
+            continue;
+        }
+        // DataChannel open → machine resets the retry budget.
+        machine.handle(ConnEvent::DcOpen);
+
+        // 7c. Resume point from the relay checkpoint (BUG-9/10).
+        let start_chunk = last_chunk_offset;
+        if start_chunk > 0 {
+            super::log::step(&format!("↻ Resuming from chunk {start_chunk}"));
+        }
+
+        sender.send_verify(&proof)?;
+
+        let cipher = crate::crypto::StreamCipher::new(&password, total_bytes as u64);
+        let stream_meta = cipher.metadata();
+        let total_chunks = stream_meta.total_chunks as u64;
+        let engine = SenderEngine::new(total_chunks, 256);
+        let transport = BufTransport { text_queue: Vec::new(), binary_queue: Vec::new() };
+        let mut adapter = SenderAdapter::new(
+            engine, LocalCipher(cipher), transport, &bytes, chunk_size, total_chunks, meta_extra.clone(),
+        );
+        adapter.start(start_chunk);
+
+        let drop_at = if test_drop_armed { test_drop_after } else { None };
+
+        // Tracks whether the recipient signalled completion (p2p:complete /
+        // p2p:both-completed). Once set, a subsequent peer-disconnect / DC-close is
+        // expected teardown, not an interruption → finish success, never retry.
+        let mut recipient_done = false;
+
+        // Monotonic "entire payload handed to the transport" latch (task 037). Set
+        // once below when `engine_sent_through()+1 >= total_chunks`, and NEVER reset
+        // within this attempt — a per-attempt scope (re-entered on rejoin/`continue`)
+        // resets it to `false` on its own. See is_done! for why this must be a latch.
+        let mut payload_fully_sent = false;
+
+        // Single completion-decision shared by every disconnect/close site (task 034).
+        // A recipient disconnect at/after a full send resolves to SUCCESS if ANY of:
+        //   1. completion was already selected (`recipient_done`),
+        //   2. the adapter finished (final ACK applied),
+        //   3. a completion is pending now (drain `complete` / `both_completed`), or
+        //   4. the entire payload was handed to the transport — the recipient (web +
+        //      CLI) only disconnects after assembling+verifying the whole payload, so
+        //      "all sent + peer gone = done" sidesteps the ACK/`complete` timing race.
+        // (4) is read from the monotonic `payload_fully_sent` latch, NOT live from
+        // `engine_sent_through()`: a late tail gap-repair `request` rewinds the
+        // engine's `next` cursor, so the live value can momentarily dip below
+        // `total_chunks` after a full send and falsely read as a mid-transfer drop.
+        macro_rules! is_done {
+            () => {
+                recipient_done
+                    || adapter.is_finished()
+                    || control.events.complete.try_recv().is_ok()
+                    || control.events.both_completed.try_recv().is_ok()
+                    || payload_fully_sent
+            };
+        }
+
+        // Drive the adapter: flush queued frames to WebRTC, consume ack/request.
+        let send_result: Result<()> = async {
             loop {
-                match sender.next_event().await {
-                    Some(crate::webrtc::LoopEvent::ChannelOpen) => return Ok::<bool, anyhow::Error>(true),
-                    Some(crate::webrtc::LoopEvent::Error(e)) => bail!("WebRTC error: {e}"),
-                    None => bail!("WebRTC closed before channel open"),
-                    _ => {}
+                // Latch "fully sent" as soon as every chunk has been handed to the
+                // transport — BEFORE the flush — so a send error or peer-disconnect
+                // during the final flush (the recipient tearing down at completion) is
+                // recognised as success, and a later gap-repair `request` that rewinds
+                // engine.next can't regress the signal. Never reset within the attempt.
+                // (Task 037)
+                if adapter
+                    .engine_sent_through()
+                    .map(|t| t + 1 >= total_chunks)
+                    .unwrap_or(false)
+                {
+                    payload_fully_sent = true;
+                }
+
+                let texts: Vec<String> = adapter.transport_mut().text_queue.drain(..).collect();
+                for t in texts {
+                    // Interruptible flush: race the blocking send against a
+                    // peer-disconnect so a real drop aborts a stuck send promptly
+                    // instead of waiting for the ICE timeout.
+                    tokio::select! {
+                        biased;
+                        r = sender.send_frame(t) => {
+                            if let Err(e) = r {
+                                // The send loop closing right at completion (recipient
+                                // tore down after assembling everything) is expected
+                                // teardown, not a failure → success, no retry. (037)
+                                if is_done!() {
+                                    recipient_done = true;
+                                    break;
+                                }
+                                return Err(e);
+                            }
+                        }
+                        _ = control.events.peer_disconnected.recv() => {
+                            // The recv future has fired and is dropped before this body
+                            // runs, so the `try_recv`s inside is_done! are free to borrow
+                            // the (disjoint) complete/both_completed channels.
+                            if is_done!() {
+                                recipient_done = true;
+                                break;
+                            }
+                            super::log::step("Receiver disconnected — reconnecting…");
+                            return Err(anyhow::anyhow!("receiver disconnected"));
+                        }
+                    }
+                }
+                let bins: Vec<Vec<u8>> = adapter.transport_mut().binary_queue.drain(..).collect();
+                let bin_count = bins.len();
+                for b in bins {
+                    tokio::select! {
+                        biased;
+                        r = sender.send_binary(b) => {
+                            if let Err(e) = r {
+                                if is_done!() {
+                                    recipient_done = true;
+                                    break;
+                                }
+                                return Err(e);
+                            }
+                        }
+                        _ = control.events.peer_disconnected.recv() => {
+                            if is_done!() {
+                                recipient_done = true;
+                                break;
+                            }
+                            super::log::step("Receiver disconnected — reconnecting…");
+                            return Err(anyhow::anyhow!("receiver disconnected"));
+                        }
+                    }
+                }
+                let sent_bytes = total_bytes.min(
+                    (adapter.engine_sent_through().unwrap_or(0) as usize + 1) * chunk_size
+                );
+                if bin_count > 0 {
+                    super::log::event(&format!(
+                        "sent {bin_count} chunk(s) — {} / {}",
+                        super::format_size(sent_bytes),
+                        super::format_size(total_bytes),
+                    ));
+                    super::display::transfer_progress(sent_bytes, total_bytes);
+                }
+
+                // Test-only one-shot drop to exercise resume.
+                if let Some(th) = drop_at {
+                    if (sent_bytes as u64) >= th {
+                        return Err(anyhow::anyhow!("test-induced drop"));
+                    }
+                }
+
+                if adapter.is_finished() {
+                    break;
+                }
+
+                tokio::select! {
+                    biased;
+                    val = control.events.ack.recv() => {
+                        if let Some(v) = val {
+                            let through = v["through"].as_u64().unwrap_or(0);
+                            adapter.on_ack(through);
+                            // Real progress after a (re)connect → reset the retry budget. (B1)
+                            if machine.attempts() > 0 { machine.handle(ConnEvent::TransferProgress); }
+                        } else {
+                            return Err(anyhow::anyhow!("control socket closed during transfer"));
+                        }
+                    }
+                    val = control.events.request.recv() => {
+                        if let Some(v) = val {
+                            let from = v["from"].as_u64().unwrap_or(0);
+                            adapter.on_request(from);
+                        } else {
+                            return Err(anyhow::anyhow!("control socket closed during transfer"));
+                        }
+                    }
+                    val = control.events.complete.recv() => {
+                        if val.is_some() {
+                            adapter.complete();
+                        }
+                        recipient_done = true;
+                        break;
+                    }
+                    _ = control.events.both_completed.recv() => {
+                        // Server's definitive "both done" signal → terminal success.
+                        adapter.complete();
+                        recipient_done = true;
+                        break;
+                    }
+                    _ = control.events.peer_disconnected.recv() => {
+                        // The recipient disconnecting AFTER it has the full payload is
+                        // expected teardown, not a failure → finish success, no retry.
+                        if is_done!() {
+                            break;
+                        }
+                        // Real mid-transfer drop — surface it at default level and
+                        // fall into the retry/rejoin path.
+                        super::log::step("Receiver disconnected — reconnecting…");
+                        return Err(anyhow::anyhow!("receiver disconnected"));
+                    }
+                    event = sender.next_event() => {
+                        match event {
+                            Some(crate::webrtc::LoopEvent::Error(e)) => {
+                                return Err(anyhow::anyhow!("WebRTC error during transfer: {e}"));
+                            }
+                            Some(crate::webrtc::LoopEvent::Done) | None => {
+                                if is_done!() {
+                                    break;
+                                }
+                                return Err(anyhow::anyhow!("DataChannel closed during transfer"));
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
-        },
-    )
-    .await;
-    match channel_open {
-        Ok(Ok(true)) => {}
-        Ok(Err(e)) => return Err(e),
-        _ => bail!("DataChannel open timed out"),
+            Ok(())
+        }.await;
+
+        if let Err(e) = send_result {
+            if e.to_string().contains("test-induced drop") {
+                test_drop_armed = false; // fire once
+            }
+            // close_and_flush (awaited) guarantees the Close reaches the event loop
+            // even when the cmd channel is full, so wait_closed can't hang.
+            sender.close_and_flush().await;
+            sender.wait_closed().await;
+            machine_retry!(
+                &format!("transfer interrupted: {e}"),
+                format!("Transfer failed after {} retries: {e}", crate::retry::DEFAULT.max_retries)
+            );
+            rejoin!();
+            continue;
+        }
+
+        // 8. Cleanup — wait for the receiver's complete (011 handshake) → exit 0.
+        sender.close_and_flush().await;
+        sender.wait_closed().await;
+        super::display::status("Transfer complete.");
+        control.complete("sender", &content_checksum)?;
+        return Ok(());
     }
-
-    // 9. Send transfer
-    sender.send_verify(&proof)?;
-    sender.send_transfer(
-        &result.encrypted_payload,
-        content_type,
-        &result.encryption_metadata,
-        file_metadata
-            .as_ref()
-            .map(|fm| serde_json::to_value(fm).unwrap())
-            .as_ref(),
-        &content_checksum,
-        &|sent, total| {
-            eprint!("\rSending: {}/{}\x1b[K", super::format_size(sent), super::format_size(total));
-        },
-    ).await?;
-
-    // 10. Wait for data to flush, then cleanup
-    sender.close_and_flush().await;
-    sender.wait_closed().await;
-    eprintln!();
-    eprintln!("\x1b[1;32m✓\x1b[0m Transfer complete.");
-    Ok(())
 }
 
 async fn run_inner(
@@ -244,6 +545,7 @@ async fn run_inner(
     local: bool,
     ttl: Option<String>,
     one_time: bool,
+    relay_only: bool,
     output: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let content = content.into();
@@ -258,7 +560,7 @@ async fn run_inner(
     validate(&content, &password, &mode, &content_type_flag)?;
 
     if mode == "p2p" {
-        return run_p2p(content, password, content_type_flag, server, local, output).await;
+        return run_p2p(content, password, content_type_flag, server, local, relay_only, output).await;
     }
     let ttl_secs = parse_ttl(ttl.as_deref())?;
     run_server(content, password, content_type_flag, server, ttl_secs, one_time, output).await
@@ -276,6 +578,7 @@ async fn run_server(
     let client = ApiClient::new(server_url(server.as_deref())?);
     let content_type = resolve_content_type(&content_type_flag);
     let ReadInput { bytes, file_metadata } = read_input(&content, content_type)?;
+    super::log::event(&format!("encrypting {} ({content_type})", super::format_size(bytes.len())));
     let spinner = super::display::Spinner::start(
         &format!("Encrypting {} …", super::format_size(bytes.len())),
     );
@@ -285,7 +588,8 @@ async fn run_server(
     drop(spinner);
 
     let total = result.encrypted_payload.len();
-    output(&format!("Uploading {} bytes…", total));
+    let _ = output; // status now routed through the leveled logger
+    super::log::step(&format!("Uploading {} bytes…", total));
     let resp = client
         .create_share(CreateShareRequest {
             content_type: content_type.into(),
@@ -299,7 +603,8 @@ async fn run_server(
             challenge_metadata: challenge.challenge_metadata,
             content_checksum,
         })
-        .await?;
+        .await
+        .map_err(super::with_conn_hint)?;
 
     let share_url = match user_url() {
         Some(base) => format!("{}/s/{}", base.trim_end_matches('/'), resp.share_id),
@@ -324,6 +629,7 @@ async fn run_p2p(
     content_type_flag: String,
     server: Option<String>,
     local: bool,
+    relay_only: bool,
     _output: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let base = server_url(server.as_deref())?;
@@ -331,17 +637,14 @@ async fn run_p2p(
     let content_type = resolve_content_type(&content_type_flag);
     let ReadInput { bytes, file_metadata } = read_input(&content, content_type)?;
 
-    // 1. Encrypt + derive password proof
-    let spinner = super::display::Spinner::start(
-        &format!("Encrypting {} …", super::format_size(bytes.len())),
-    );
+    // 1. Derive password proof + checksum (streaming: no upfront encryption)
     let content_checksum = crate::crypto::sha256_bytes(&bytes);
-    let result = encrypt_bytes(&bytes, &password);
     let proof = sha256_hex(&password);
-    drop(spinner);
 
     // 2. Create P2P session on the server
-    let session = client.create_p2p_session(&proof).await?;
+    super::log::event("creating session");
+    let session = client.create_p2p_session(&proof).await.map_err(super::with_conn_hint)?;
+    super::log::event(&format!("session created {}", session.session_id));
     let p2p_url = match user_url() {
         Some(base) => format!("{}/p2p/{}", base.trim_end_matches('/'), session.session_id),
         None => session.share_url,
@@ -359,55 +662,118 @@ async fn run_p2p(
     let ice_servers = client.get_ice_servers().await.unwrap_or_default();
 
     // 4. Connect socket as sender
-    let (mut socket, mut events) = P2PSocket::connect(&base, &session.session_id, "sender").await?;
+    let ws_url = TungsteniteWs::build_url(&base)?;
+    super::log::event(&format!("connecting to {ws_url}"));
+    let ws = TungsteniteWs::connect(&ws_url).await?;
+    let (transport, evts) = SocketIoTransport::connect(ws, "p2p").await?;
+    super::log::event("connected (socket)");
+    let mut control = P2PControl::new(transport, evts);
 
-    // 5. Wait for joined ack
-    tokio::select! {
+    // 4b. Emit join
+    control.join(&session.session_id, "sender")?;
+
+    // 5. Wait for joined ack — capture the server's cumulative-ACK checkpoint so we
+    //    resume (not restart) after a drop. (BUG-10)
+    let mut last_chunk_offset: u64 = tokio::select! {
         biased;
-        j = events.joined.recv() => {
-            j.ok_or_else(|| anyhow::anyhow!("socket closed before joined"))?;
+        j = control.events.joined.recv() => {
+            let j = j.ok_or_else(|| anyhow::anyhow!("socket closed before joined"))?;
+            j.get("lastChunkOffset").and_then(|v| v.as_u64()).unwrap_or(0)
         }
-        err = events.error.recv() => {
+        err = control.events.error.recv() => {
             bail!("signaling error before joined: {}", err.unwrap_or_else(|| "unknown".into()));
         }
-    }
+    };
 
-    // 6. Retry loop for WebRTC connection + transfer
-    let policy = &crate::retry::DEFAULT;
-    let mut attempt = 0u32;
+    // 6. Reconnection driven by the shared `ConnectionMachine` (same pure model as
+    //    the web client, task 001/013). The machine owns the retry budget, backoff,
+    //    fatal-vs-transient classification, and the resume checkpoint; this loop
+    //    feeds it lifecycle events and executes its decisions.
+    use crate::p2p::connection::{ConnEvent, ConnPhase, ConnectionMachine};
+    let mut machine = ConnectionMachine::new(
+        crate::retry::DEFAULT.max_retries,
+        crate::retry::DEFAULT.backoff_ms.to_vec(),
+        crate::retry::CHANNEL_TIMEOUT_SECS * 1000,
+    );
+    machine.handle(ConnEvent::Start);
+    machine.handle(ConnEvent::SocketUp);
+    machine.handle(ConnEvent::Joined { last_chunk_offset, generation: 0 });
+
+    // Test-only one-shot mid-transfer drop (CLI analog of the web PC-close), so the
+    // online resume path runs deterministically in e2e. Inert in production.
+    let test_drop_after: Option<u64> = std::env::var("NULLSEAL_TEST_DROP_AFTER_BYTES")
+        .ok()
+        .and_then(|s| s.parse().ok());
+    let mut test_drop_armed = test_drop_after.is_some();
 
     // Helper: reconnect socket if dead, then emit join
     macro_rules! rejoin {
         () => {{
-            if !socket.is_alive() {
-                let (new_socket, new_events) = P2PSocket::connect(&base, &session.session_id, "sender").await?;
-                socket = new_socket;
-                events = new_events;
-                // Wait for joined ack on new socket
-                events.joined.recv().await
+            // Discard stale signaling from the previous round BEFORE re-joining so
+            // the next `await_ready` blocks on the FRESH `both_ready` that THIS
+            // re-join triggers. A leftover `both_ready` would otherwise make us
+            // send an offer against a stale state → server `invalid_state`.
+            super::p2p_stages::drain(&mut control.events.both_ready);
+            super::p2p_stages::drain(&mut control.events.answer);
+            super::p2p_stages::drain(&mut control.events.ice);
+            // Clear stale errors (e.g. a `peer_timeout` from the previous round)
+            // so the next `await_ready` doesn't immediately act on them.
+            super::p2p_stages::drain(&mut control.events.error);
+            if !control.is_alive() {
+                let ws = TungsteniteWs::connect(&ws_url).await?;
+                let (transport, evts) = SocketIoTransport::connect(ws, "p2p").await?;
+                control = P2PControl::new(transport, evts);
+                control.join(&session.session_id, "sender")?;
+                // Wait for joined ack on new socket; refresh the resume checkpoint.
+                let j = control.events.joined.recv().await
                     .ok_or_else(|| anyhow::anyhow!("socket closed before joined on reconnect"))?;
+                last_chunk_offset = j.get("lastChunkOffset").and_then(|v| v.as_u64()).unwrap_or(last_chunk_offset);
+                machine.handle(ConnEvent::SocketUp);
+                machine.handle(ConnEvent::Joined { last_chunk_offset, generation: 0 });
             } else {
-                socket.emit_join(&session.session_id, "sender")?;
+                control.join(&session.session_id, "sender")?;
+                // Re-join on the live socket also emits a fresh `joined` — read it to
+                // pick up the latest checkpoint before resuming.
+                if let Some(j) = control.events.joined.recv().await {
+                    last_chunk_offset = j.get("lastChunkOffset").and_then(|v| v.as_u64()).unwrap_or(last_chunk_offset);
+                }
+                machine.handle(ConnEvent::Joined { last_chunk_offset, generation: 0 });
+            }
+        }};
+    }
+
+    // Drive one failure through the machine: it decides retry-with-backoff vs
+    // Stopped (manual prompt) vs Expired. Returns nothing; the caller `rejoin!`s
+    // and `continue`s. `$reason` labels the retry; `$bail` is the give-up message.
+    macro_rules! machine_retry {
+        ($reason:expr, $bail:expr) => {{
+            let acts = machine.handle(ConnEvent::DcClosed);
+            if machine.phase() == ConnPhase::Stopped {
+                if !crate::retry::prompt_manual().await {
+                    bail!($bail);
+                }
+                machine.handle(ConnEvent::ManualRetry);
+            } else {
+                crate::retry::log_retry(
+                    machine.attempts(), crate::retry::DEFAULT.max_retries, $reason,
+                );
+                let delay_ms = crate::commands::p2p_stages::retry_delay_ms(&acts);
+                machine.handle(ConnEvent::RetryTimer);
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
             }
         }};
     }
 
     loop {
-        // 6a. Wait for ready (recipient has joined)
-        let got_ready = super::p2p_stages::await_ready(&mut events, attempt == 0).await?;
+        // 6a. Wait for ready (recipient has joined). First attempt (machine budget
+        //     not yet spent) waits indefinitely; retries use the peer timeout.
+        let got_ready = super::p2p_stages::await_ready(&mut control.events, machine.attempts() == 0).await?;
 
         if !got_ready {
-            attempt += 1;
-            if policy.exhausted(attempt) {
-                if !crate::retry::prompt_manual().await {
-                    bail!("Recipient did not rejoin after {} retries.", policy.max_retries);
-                }
-                attempt = 0;
-                rejoin!();
-                continue;
-            }
-            crate::retry::log_retry(attempt, policy.max_retries, "recipient not ready…");
-            tokio::time::sleep(policy.delay(attempt)).await;
+            machine_retry!(
+                "recipient not ready…",
+                format!("Recipient did not rejoin after {} retries.", crate::retry::DEFAULT.max_retries)
+            );
             rejoin!();
             continue;
         }
@@ -415,74 +781,302 @@ async fn run_p2p(
 
         // 7. Create WebRTC sender peer + offer
         // Drain stale signaling events from previous rounds
-        while events.answer.try_recv().is_ok() {}
-        while events.ice.try_recv().is_ok() {}
+        while control.events.answer.try_recv().is_ok() {}
+        while control.events.ice.try_recv().is_ok() {}
 
-        let mut sender = SenderPeer::new(ice_servers.clone(), None).await?;
-        socket.send_offer(sender.offer_sdp_json()).await?;
+        let mut sender = if relay_only {
+            SenderPeer::new_relay_only(ice_servers.clone(), None).await?
+        } else {
+            SenderPeer::new(ice_servers.clone(), None).await?
+        };
+        control.offer(&sender.offer_sdp_json())?;
 
         // 8. Wait for answer + relay ICE candidates
-        super::p2p_stages::await_answer(&sender, &mut events).await?;
+        super::p2p_stages::await_answer(&sender, &mut control.events).await?;
 
         // 9. Wait for DataChannel open
-        let channel_open = super::p2p_stages::await_sender_channel(&mut sender, &mut events).await?;
+        let channel_open = super::p2p_stages::await_sender_channel(&mut sender, &mut control.events).await?;
 
         if !channel_open {
-            attempt += 1;
-            if policy.exhausted(attempt) {
-                if !crate::retry::prompt_manual().await {
-                    bail!("WebRTC connection failed after {} retries.", policy.max_retries);
-                }
-                attempt = 0;
-                rejoin!();
-                continue;
-            }
-            crate::retry::log_retry(attempt, policy.max_retries, "channel open failed…");
-            tokio::time::sleep(policy.delay(attempt)).await;
+            machine_retry!(
+                "channel open failed…",
+                format!("WebRTC connection failed after {} retries.", crate::retry::DEFAULT.max_retries)
+            );
             rejoin!();
             continue;
         }
 
-        // Reset retry counter on successful connection
-        attempt = 0;
+        // DataChannel open → machine resets the retry budget (Transferring phase).
+        machine.handle(ConnEvent::DcOpen);
 
-        // 10. Wait for resume frame from receiver
-        let start_chunk = sender.wait_for_resume(crate::retry::RESUME_WAIT_MS).await;
+        // 10. Resume point = p2p:joined lastChunkOffset (server's cumulative-ACK
+        //     checkpoint, refreshed by `rejoin!`). Equals the receiver's `resume_from`
+        //     so the cipher nonce stays aligned. (BUG-10) The machine tracks the same
+        //     value for its own budget logic, but `last_chunk_offset` is the I/O truth.
+        let start_chunk = last_chunk_offset;
         if start_chunk > 0 {
-            eprintln!("\x1b[1;34m↻\x1b[0m Resuming from chunk {start_chunk}");
+            super::log::step(&format!("↻ Resuming from chunk {start_chunk}"));
         }
 
-        // 11. Send encrypted transfer over DataChannel
+        // 11. Send verify + stream via SenderAdapter (v2 binary protocol)
         sender.send_verify(&proof)?;
-        let send_result = sender.send_transfer_from(
-            &result.encrypted_payload,
-            content_type,
-            &result.encryption_metadata,
-            file_metadata
-                .as_ref()
-                .map(|fm| serde_json::to_value(fm).unwrap())
-                .as_ref(),
-            &content_checksum,
-            start_chunk,
-            &|sent, total| {
-                super::display::transfer_progress(sent, total);
-            },
-        ).await;
+
+        let cipher = crate::crypto::StreamCipher::new(&password, bytes.len() as u64);
+        let stream_meta = cipher.metadata();
+        let chunk_size = crate::crypto::STREAM_CHUNK_SIZE;
+        let total_chunks = stream_meta.total_chunks as u64;
+
+        // Build metadata extra fields (camelCase, matching web)
+        let meta_extra = serde_json::json!({
+            "contentType": content_type,
+            "fileMetadata": file_metadata.as_ref().map(|fm| serde_json::to_value(fm).unwrap()),
+            "contentChecksum": &content_checksum,
+        });
+
+        // Create the adapter with a collecting transport; we drive it
+        // in a loop feeding ack/request from the socket.
+        use crate::p2p::sender_adapter::{SenderAdapter, SenderCipherT, SenderTransport};
+        use crate::p2p::sender_engine::SenderEngine;
+
+        struct RealCipher(crate::crypto::StreamCipher);
+        impl SenderCipherT for RealCipher {
+            fn metadata(&self) -> serde_json::Value {
+                serde_json::to_value(self.0.metadata()).unwrap()
+            }
+            fn chunk_index(&self) -> u64 { self.0.chunk_index() }
+            fn skip_to(&mut self, index: u64) { self.0.skip_to(index); }
+            fn encrypt_chunk(&mut self, plaintext: &[u8]) -> anyhow::Result<Vec<u8>> {
+                self.0.encrypt_chunk(plaintext).map_err(|e| anyhow::anyhow!("{e}"))
+            }
+        }
+
+        // Buffered transport: collects frames to be sent asynchronously
+        struct BufTransport {
+            text_queue: Vec<String>,
+            binary_queue: Vec<Vec<u8>>,
+        }
+        impl SenderTransport for BufTransport {
+            fn send_text(&mut self, s: String) { self.text_queue.push(s); }
+            fn send_binary(&mut self, b: Vec<u8>) { self.binary_queue.push(b); }
+        }
+
+        let engine = SenderEngine::new(total_chunks, 256);
+        let transport = BufTransport { text_queue: Vec::new(), binary_queue: Vec::new() };
+        let real_cipher = RealCipher(cipher);
+        let mut adapter = SenderAdapter::new(
+            engine, real_cipher, transport, &bytes, chunk_size, total_chunks, meta_extra,
+        );
+
+        adapter.start(start_chunk);
+
+        // Drive the adapter: flush queued frames to WebRTC, consume ack/request
+        let total_bytes = bytes.len();
+        let drop_at = if test_drop_armed { test_drop_after } else { None };
+
+        // Tracks whether the recipient signalled completion (p2p:complete /
+        // p2p:both-completed). Once set, a subsequent peer-disconnect / DC-close is
+        // expected teardown, not an interruption → finish success, never retry.
+        let mut recipient_done = false;
+
+        // Monotonic "entire payload handed to the transport" latch (task 037). Set
+        // once below when `engine_sent_through()+1 >= total_chunks`, and NEVER reset
+        // within this attempt — a per-attempt scope (re-entered on rejoin/`continue`)
+        // resets it to `false` on its own. See is_done! for why this must be a latch.
+        let mut payload_fully_sent = false;
+
+        // Single completion-decision shared by every disconnect/close site (task 034).
+        // A recipient disconnect at/after a full send resolves to SUCCESS if ANY of:
+        //   1. completion was already selected (`recipient_done`),
+        //   2. the adapter finished (final ACK applied),
+        //   3. a completion is pending now (drain `complete` / `both_completed`), or
+        //   4. the entire payload was handed to the transport — the recipient (web +
+        //      CLI) only disconnects after assembling+verifying the whole payload, so
+        //      "all sent + peer gone = done" sidesteps the ACK/`complete` timing race.
+        // (4) is read from the monotonic `payload_fully_sent` latch, NOT live from
+        // `engine_sent_through()`: a late tail gap-repair `request` rewinds the
+        // engine's `next` cursor, so the live value can momentarily dip below
+        // `total_chunks` after a full send and falsely read as a mid-transfer drop.
+        macro_rules! is_done {
+            () => {
+                recipient_done
+                    || adapter.is_finished()
+                    || control.events.complete.try_recv().is_ok()
+                    || control.events.both_completed.try_recv().is_ok()
+                    || payload_fully_sent
+            };
+        }
+
+        let send_result: Result<()> = async {
+            loop {
+                // Latch "fully sent" as soon as every chunk has been handed to the
+                // transport — BEFORE the flush — so a send error or peer-disconnect
+                // during the final flush (the recipient tearing down at completion) is
+                // recognised as success, and a later gap-repair `request` that rewinds
+                // engine.next can't regress the signal. Never reset within the attempt.
+                // (Task 037)
+                if adapter
+                    .engine_sent_through()
+                    .map(|t| t + 1 >= total_chunks)
+                    .unwrap_or(false)
+                {
+                    payload_fully_sent = true;
+                }
+
+                // Flush text frames
+                let texts: Vec<String> = adapter.transport_mut().text_queue.drain(..).collect();
+                for t in texts {
+                    // Interruptible flush: race the blocking send against a
+                    // peer-disconnect so a real drop aborts a stuck send promptly
+                    // instead of waiting for the ICE timeout.
+                    tokio::select! {
+                        biased;
+                        r = sender.send_frame(t) => {
+                            if let Err(e) = r {
+                                // The send loop closing right at completion (recipient
+                                // tore down after assembling everything) is expected
+                                // teardown, not a failure → success, no retry. (037)
+                                if is_done!() {
+                                    recipient_done = true;
+                                    break;
+                                }
+                                return Err(e);
+                            }
+                        }
+                        _ = control.events.peer_disconnected.recv() => {
+                            // The recv future has fired and is dropped before this body
+                            // runs, so the `try_recv`s inside is_done! are free to borrow
+                            // the (disjoint) complete/both_completed channels.
+                            if is_done!() {
+                                recipient_done = true;
+                                break;
+                            }
+                            super::log::step("Receiver disconnected — reconnecting…");
+                            return Err(anyhow::anyhow!("receiver disconnected"));
+                        }
+                    }
+                }
+                // Flush binary frames
+                let bins: Vec<Vec<u8>> = adapter.transport_mut().binary_queue.drain(..).collect();
+                let bin_count = bins.len();
+                for b in bins {
+                    tokio::select! {
+                        biased;
+                        r = sender.send_binary(b) => {
+                            if let Err(e) = r {
+                                if is_done!() {
+                                    recipient_done = true;
+                                    break;
+                                }
+                                return Err(e);
+                            }
+                        }
+                        _ = control.events.peer_disconnected.recv() => {
+                            if is_done!() {
+                                recipient_done = true;
+                                break;
+                            }
+                            super::log::step("Receiver disconnected — reconnecting…");
+                            return Err(anyhow::anyhow!("receiver disconnected"));
+                        }
+                    }
+                }
+                let sent_bytes = total_bytes.min(
+                    (adapter.engine_sent_through().unwrap_or(0) as usize + 1) * chunk_size
+                );
+                if bin_count > 0 {
+                    super::log::event(&format!(
+                        "sent {bin_count} chunk(s) — {} / {}",
+                        super::format_size(sent_bytes),
+                        super::format_size(total_bytes),
+                    ));
+                    super::display::transfer_progress(sent_bytes, total_bytes);
+                }
+
+                // Test-only one-shot drop to exercise the resume path deterministically.
+                if let Some(th) = drop_at {
+                    if (sent_bytes as u64) >= th {
+                        return Err(anyhow::anyhow!("test-induced drop"));
+                    }
+                }
+
+                if adapter.is_finished() {
+                    break;
+                }
+
+                // Wait for socket events (ack/request/complete) or DC errors
+                tokio::select! {
+                    biased;
+                    val = control.events.ack.recv() => {
+                        if let Some(v) = val {
+                            let through = v["through"].as_u64().unwrap_or(0);
+                            adapter.on_ack(through);
+                            // Real progress after a (re)connect → reset the retry budget. (B1)
+                            if machine.attempts() > 0 { machine.handle(ConnEvent::TransferProgress); }
+                        } else {
+                            break; // socket closed
+                        }
+                    }
+                    val = control.events.request.recv() => {
+                        if let Some(v) = val {
+                            let from = v["from"].as_u64().unwrap_or(0);
+                            adapter.on_request(from);
+                        } else {
+                            break;
+                        }
+                    }
+                    val = control.events.complete.recv() => {
+                        if val.is_some() {
+                            adapter.complete();
+                        }
+                        recipient_done = true;
+                        break;
+                    }
+                    _ = control.events.both_completed.recv() => {
+                        // Server's definitive "both done" signal → terminal success.
+                        adapter.complete();
+                        recipient_done = true;
+                        break;
+                    }
+                    _ = control.events.peer_disconnected.recv() => {
+                        // The recipient disconnecting AFTER it has the full payload is
+                        // expected teardown, not a failure → finish success, no retry.
+                        if is_done!() {
+                            break;
+                        }
+                        // Real mid-transfer drop — surface it at default level and
+                        // fall into the retry/rejoin path.
+                        super::log::step("Receiver disconnected — reconnecting…");
+                        return Err(anyhow::anyhow!("receiver disconnected"));
+                    }
+                    event = sender.next_event() => {
+                        match event {
+                            Some(crate::webrtc::LoopEvent::Error(e)) => {
+                                return Err(anyhow::anyhow!("WebRTC error during transfer: {e}"));
+                            }
+                            Some(crate::webrtc::LoopEvent::Done) | None => {
+                                if is_done!() {
+                                    break;
+                                }
+                                return Err(anyhow::anyhow!("DataChannel closed during transfer"));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }.await;
 
         if let Err(e) = send_result {
-            eprintln!();
+            if e.to_string().contains("test-induced drop") {
+                test_drop_armed = false; // fire once
+            }
             sender.close();
             sender.wait_closed().await;
-            attempt += 1;
-            if policy.exhausted(attempt) {
-                if !crate::retry::prompt_manual().await {
-                    bail!("Transfer failed after {} retries: {e}", policy.max_retries);
-                }
-                attempt = 0;
-            } else {
-                crate::retry::log_retry(attempt, policy.max_retries, &format!("transfer interrupted: {e}"));
-                tokio::time::sleep(policy.delay(attempt)).await;
-            }
+            machine_retry!(
+                &format!("transfer interrupted: {e}"),
+                format!("Transfer failed after {} retries: {e}", crate::retry::DEFAULT.max_retries)
+            );
             rejoin!();
             continue;
         }
@@ -491,11 +1085,10 @@ async fn run_p2p(
         sender.close_and_flush().await;
         sender.wait_closed().await;
 
-        eprintln!();
         super::display::status("Transfer complete.");
 
-        socket.done().await?;
-        socket.disconnect().await?;
+        control.complete("sender", &content_checksum)?;
+        control.delete()?;
         return Ok(());
     }
 }
@@ -594,7 +1187,7 @@ mod tests {
             .await;
 
         // Rich display now goes to stderr; just verify the command succeeds
-        run("hello", "password", "u", "txt", Some(url), None, true, &mut |_| {})
+        run("hello", "password", "u", "txt", Some(url), None, true, false, &mut |_| {})
             .await
             .unwrap();
     }
@@ -608,7 +1201,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run("hunter2", "password", "u", "pwd", Some(url), None, true, &mut |_| {})
+        run("hunter2", "password", "u", "pwd", Some(url), None, true, false, &mut |_| {})
             .await
             .unwrap();
 
@@ -619,19 +1212,19 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_short_password() {
-        let err = run("hi", "ab", "u", "txt", None, None, true, &mut |_| {}).await.unwrap_err();
+        let err = run("hi", "ab", "u", "txt", None, None, true, false, &mut |_| {}).await.unwrap_err();
         assert!(err.to_string().contains("Password"));
     }
 
     #[tokio::test]
     async fn rejects_empty_content() {
-        let err = run("   ", "password", "u", "txt", None, None, true, &mut |_| {}).await.unwrap_err();
+        let err = run("   ", "password", "u", "txt", None, None, true, false, &mut |_| {}).await.unwrap_err();
         assert!(err.to_string().contains("empty"));
     }
 
     #[tokio::test]
     async fn rejects_unsupported_extension() {
-        let err = run("script.exe", "password", "u", "file", None, None, true, &mut |_| {})
+        let err = run("script.exe", "password", "u", "file", None, None, true, false, &mut |_| {})
             .await
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("unsupported"));
@@ -651,7 +1244,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run(tmp_path, "password", "u", "file", Some(url), None, true, &mut |_| {})
+        run(tmp_path, "password", "u", "file", Some(url), None, true, false, &mut |_| {})
             .await
             .unwrap();
 
@@ -670,10 +1263,12 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run("hello", "password", "u", "txt", Some(url), None, true, &mut |_| {})
+        let err = run("hello", "password", "u", "txt", Some(url), None, true, false, &mut |_| {})
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Request failed"));
+        let msg = err.to_string();
+        assert!(msg.contains("500"), "expected status in error, got: {msg}");
+        assert!(msg.contains("/shares"), "expected url path in error, got: {msg}");
     }
 
     // ── validate ─────────────────────────────────────────────────────────
@@ -753,7 +1348,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_inner_local_requires_p2p() {
-        let err = run_inner("hello", "password", "u", "txt", None, true, None, true, &mut |_| {})
+        let err = run_inner("hello", "password", "u", "txt", None, true, None, true, false, &mut |_| {})
             .await
             .unwrap_err();
         assert!(err.to_string().contains("--local requires --p2p"));
@@ -775,7 +1370,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run(tmp_path, "password", "u", "file", Some(url), None, true, &mut |_| {})
+        run(tmp_path, "password", "u", "file", Some(url), None, true, false, &mut |_| {})
             .await
             .unwrap();
 
@@ -793,7 +1388,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run("hello world", "password", "u", "txt", Some(url), None, true, &mut |_| {})
+        run("hello world", "password", "u", "txt", Some(url), None, true, false, &mut |_| {})
             .await
             .unwrap();
 
@@ -855,7 +1450,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run("hello", "password", "u", "txt", Some(url), None, false, &mut |_| {})
+        run("hello", "password", "u", "txt", Some(url), None, false, false, &mut |_| {})
             .await
             .unwrap();
 
@@ -873,7 +1468,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        run("hello", "password", "u", "txt", Some(url), Some("1h".into()), true, &mut |_| {})
+        run("hello", "password", "u", "txt", Some(url), Some("1h".into()), true, false, &mut |_| {})
             .await
             .unwrap();
 

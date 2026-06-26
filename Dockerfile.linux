@@ -1,95 +1,73 @@
 # syntax=docker/dockerfile:1
 #
-# Builds the NullSeal Rust CLI as a static Linux binary (musl).
-# The output binary has zero shared-library dependencies and runs on any
-# Linux distro regardless of glibc version.
+# Builds the NullSeal Rust CLI as a static Linux binary (musl) by
+# CROSS-COMPILING from the host's native architecture — NO QEMU/Rosetta
+# emulation of the build.
 #
-# Supported targets (via Docker BuildKit + QEMU):
-#   linux/amd64  →  x86_64-unknown-linux-musl
-#   linux/arm64  →  aarch64-unknown-linux-musl
+# Why: the previous version ran the whole builder stage under emulation
+# (e.g. linux/amd64 on an Apple-Silicon host). Under emulation Debian's apt /
+# gpgv mis-verifies repository signatures ("At least one invalid signature was
+# encountered"), which broke `apt-get update`. Cross-compiling keeps the builder
+# on $BUILDPLATFORM (native), so no apt/gpgv runs emulated.
 #
-# ── Build ────────────────────────────────────────────────────────────────────
+# The builder image is `messense/rust-musl-cross:<arch>-musl`, which bundles the
+# Rust toolchain, the musl cross C toolchain (for `ring` + vendored OpenSSL via
+# str0m), perl/make, and a prebuilt OpenSSL for the target. These images are
+# multi-arch, so they run natively on amd64 OR arm64 hosts.
 #
-#   Single platform (outputs ./dist/nullseal):
-#     docker buildx build --platform linux/amd64 --output dist/ .
-#     docker buildx build --platform linux/arm64 --output dist/ .
+# ── Build (driven by publish.sh) ─────────────────────────────────────────────
 #
-#   Both platforms in one pass (outputs to separate subdirs):
-#     docker buildx build \
-#       --platform linux/amd64,linux/arm64 \
-#       --output dist/ .
+#   x86_64:
+#     docker buildx build -f Dockerfile.linux \
+#       --build-arg CROSS_IMAGE=messense/rust-musl-cross:x86_64-musl \
+#       --build-arg RUST_TARGET=x86_64-unknown-linux-musl \
+#       --output type=local,dest=out .
 #
-# ── Notes ────────────────────────────────────────────────────────────────────
+#   aarch64:
+#     docker buildx build -f Dockerfile.linux \
+#       --build-arg CROSS_IMAGE=messense/rust-musl-cross:aarch64-musl \
+#       --build-arg RUST_TARGET=aarch64-unknown-linux-musl \
+#       --output type=local,dest=out .
 #
-#   First build is slow (compiles all dependencies). Subsequent builds are
-#   fast because the dependency layer is cached separately from src/.
+#   Note: do NOT pass `--platform`. The target arch is selected by RUST_TARGET;
+#   the builder always runs on the native host arch ($BUILDPLATFORM).
 #
-#   QEMU must be registered for cross-platform builds on an amd64 host:
-#     docker run --rm --privileged tonistiigi/binfmt --install all
-#   Most Docker Desktop / CI setups already have this.
+#   First build is slow (compiles all deps incl. vendored OpenSSL). Subsequent
+#   builds reuse the cargo registry/target cache mounts.
 
-# Pin the Rust toolchain version for reproducible builds.
-# Update this line to upgrade the compiler.
-ARG RUST_VERSION=1.88
+# Default to x86_64; publish.sh overrides both args per target.
+ARG CROSS_IMAGE=messense/rust-musl-cross:x86_64-musl
 
-# ── Stage 1: install toolchain + deps ────────────────────────────────────────
-FROM rust:${RUST_VERSION}-slim-bookworm AS builder
+# Pin the builder to the BUILD platform (native) — this is what avoids emulation.
+FROM --platform=$BUILDPLATFORM ${CROSS_IMAGE} AS builder
 
-ARG TARGETARCH
-
-# musl-tools: musl C toolchain for static linking.
-# perl + make: required by vendored OpenSSL build.
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    musl-tools \
-    perl \
-    make \
-    && rm -rf /var/lib/apt/lists/*
-
-# Map Docker arch name → Rust target triple and write to /rust-target.
-RUN case "$TARGETARCH" in \
-    amd64) echo x86_64-unknown-linux-musl  ;; \
-    arm64) echo aarch64-unknown-linux-musl ;; \
-    *)     echo "Unsupported architecture: $TARGETARCH" >&2 && exit 1 ;; \
-    esac > /rust-target
-
-RUN rustup target add "$(cat /rust-target)"
+ARG RUST_TARGET=x86_64-unknown-linux-musl
 
 WORKDIR /app
 
-# Use musl-gcc for static musl builds. Vendored OpenSSL builds from source.
-ENV CC=musl-gcc
+# Ensure the requested musl target is installed (no-op on the matching image).
+RUN rustup target add "${RUST_TARGET}"
 
-# ── Stage 2: cache dependencies ───────────────────────────────────────────────
-# Copy only the manifest files and compile a stub main so that the expensive
-# dependency compilation step is cached independently from the source code.
-# This layer is invalidated only when Cargo.toml or Cargo.lock changes.
-COPY Cargo.toml Cargo.lock build.rs ./
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETARCH} \
-    --mount=type=cache,target=/app/target,id=cargo-target-${TARGETARCH} \
-    mkdir src \
-    && echo 'fn main(){}' > src/main.rs \
-    && touch .env \
-    && cargo build --release --target "$(cat /rust-target)" \
-    && rm -rf src
-
-# ── Stage 3: build the real binary ───────────────────────────────────────────
+# ── Copy the full Cargo workspace ─────────────────────────────────────────────
+# This is a workspace: the root crate depends on the local member crates under
+# crates/ (socketio, p2p-control, turn), so they must all be present. .env holds
+# the compile-time vars (CLI_APPS_CORE_URL, CLI_APPS_USER_URL) that build.rs reads.
+# .dockerignore already excludes target/, npm/, .git/, .dist/, *.md.
+COPY Cargo.toml Cargo.lock build.rs .env ./
 COPY src ./src
+COPY crates ./crates
 
-# .env must exist in the build context with compile-time env vars
-# (e.g. NULLSEAL_API_URL, NULLSEAL_USER_URL). build.rs reads this file.
-COPY .env ./
+# ── Build the static musl binary ──────────────────────────────────────────────
+# The cargo registry + target cache mounts persist compiled dependencies (incl.
+# the vendored OpenSSL build) across builds, so rebuilds are incremental even
+# without a separate stub-deps layer. `--config profile.release.strip=true`
+# strips symbols at link time, so no target-specific `strip` binary is needed.
+RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${RUST_TARGET} \
+    --mount=type=cache,target=/app/target,id=cargo-target-${RUST_TARGET} \
+    cargo build --release --target "${RUST_TARGET}" --config profile.release.strip=true \
+    && cp "target/${RUST_TARGET}/release/nullseal" /nullseal
 
-# Touch main.rs so cargo knows src changed (the stub was compiled above).
-RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETARCH} \
-    --mount=type=cache,target=/app/target,id=cargo-target-${TARGETARCH} \
-    touch src/main.rs \
-    && cargo build --release --target "$(cat /rust-target)" \
-    && cp "target/$(cat /rust-target)/release/nullseal" /nullseal-out
-
-# Strip debug symbols — reduces binary size by ~60-70%.
-RUN strip /nullseal-out && mv /nullseal-out /nullseal
-
-# ── Stage 4: export — nothing but the binary ─────────────────────────────────
-# 'docker buildx build --output dist/ .' copies /nullseal out of this stage.
+# ── Export — nothing but the binary ──────────────────────────────────────────
+# 'docker buildx build --output type=local,dest=<dir> .' copies /nullseal out.
 FROM scratch
 COPY --from=builder /nullseal /nullseal

@@ -1,6 +1,6 @@
 {
   "name": "@nullseal/darwin-arm64",
-  "version": "0.15.3",
+  "version": "0.15.7",
   "description": "NullSeal CLI binary for macOS arm64 (Apple Silicon)",
   "license": "MIT",
   "repository": {

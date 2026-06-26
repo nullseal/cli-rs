@@ -1,0 +1,16 @@
+[package]
+name = "nullseal-turn"
+version = "0.1.0"
+edition = "2021"
+description = "STUN/TURN codec + pure Allocate state machine (no I/O)"
+
+[dependencies]
+hmac = "0.12"
+sha1 = "0.10"
+md-5 = "0.10"
+crc = "3"
+rand = "0.8"
+thiserror = "1"
+
+[dev-dependencies]
+hex-literal = "0.4"

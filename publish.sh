@@ -77,15 +77,19 @@ rm -rf "$DIST_DIR"
 
 for arch in amd64 arm64; do
   case "$arch" in
-    amd64) PKG="linux-x64" ;;
-    arm64) PKG="linux-arm64" ;;
+    amd64) PKG="linux-x64";   CROSS_IMAGE="messense/rust-musl-cross:x86_64-musl";  RUST_TARGET="x86_64-unknown-linux-musl" ;;
+    arm64) PKG="linux-arm64"; CROSS_IMAGE="messense/rust-musl-cross:aarch64-musl"; RUST_TARGET="aarch64-unknown-linux-musl" ;;
   esac
 
-  echo "🔨 Building linux/$arch via Docker..."
+  # Cross-compile from the native host arch (NO --platform / no emulation): the
+  # target is chosen by RUST_TARGET, the builder runs on $BUILDPLATFORM. This
+  # avoids the emulated apt/gpgv "invalid signature" failure. See Dockerfile.linux.
+  echo "🔨 Building $RUST_TARGET via Docker (native cross-compile)..."
   mkdir -p "npm/$PKG/bin"
   docker buildx build \
     -f Dockerfile.linux \
-    --platform "linux/$arch" \
+    --build-arg "CROSS_IMAGE=$CROSS_IMAGE" \
+    --build-arg "RUST_TARGET=$RUST_TARGET" \
     --output "type=local,dest=npm/$PKG/bin" \
     .
   chmod +x "npm/$PKG/bin/nullseal"
