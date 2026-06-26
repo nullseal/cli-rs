@@ -65,8 +65,8 @@ pub async fn run(
             }
 
             // Verify ownership first
-            super::log::step("Verifying ownership…");
-            let info = client.verify_owner(share_id, full_owner_code).await?;
+            super::log::event("Verifying ownership…");
+            let info = client.verify_owner(share_id, full_owner_code).await.map_err(super::with_conn_hint)?;
 
             // Resolve content type
             let new_content_type = resolve_content_type(&content_type_flag);
@@ -89,7 +89,7 @@ pub async fn run(
             let challenge = generate_challenge(&password);
 
             // Replace
-            super::log::step("Replacing share content…");
+            super::log::event("Replacing share content…");
             client
                 .replace_share(
                     share_id,
@@ -110,10 +110,10 @@ pub async fn run(
             super::display::status("Share content replaced successfully.");
         }
         "destroy" => {
-            super::log::step("Verifying ownership…");
-            client.verify_owner(share_id, full_owner_code).await?;
+            super::log::event("Verifying ownership…");
+            client.verify_owner(share_id, full_owner_code).await.map_err(super::with_conn_hint)?;
 
-            super::log::step("Destroying share…");
+            super::log::event("Destroying share…");
             client.destroy_share(share_id, full_owner_code).await?;
 
             super::display::status("Share destroyed.");
@@ -228,6 +228,13 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    // The interactive destroy confirmation prompt and the non-TTY guard live in
+    // `main.rs` (they gate the call to `run`), so they cannot be unit-tested here:
+    // `run` is reached only after confirmation passes (or --yes bypasses it). This
+    // test exercises that post-confirmation path — destroy verifies ownership then
+    // calls DELETE, which is exactly the `--yes` / confirmed flow. The non-TTY
+    // refusal and the interactive prompt are covered by the leader's manual check
+    // and the e2e specs (s1-5 1.5.5/1.5.7, s4 4.30).
     #[tokio::test]
     async fn destroy_share() {
         let (server, uri) = setup().await;

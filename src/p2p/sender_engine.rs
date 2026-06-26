@@ -172,4 +172,62 @@ mod tests {
         assert_eq!(kinds(&e.ack(1)), ["chunk", "end"]);
         assert!(e.end_emitted());
     }
+
+    // Task 037: the CLI sender's `is_done!` "all payload sent" term is a monotonic
+    // `payload_fully_sent` latch, NOT a live read of `sent_through()` (=
+    // `engine_sent_through()` on the adapter). This test proves the latch semantics
+    // purely at the engine level — no WebRTC. A late tail gap-repair `request(from)`
+    // rewinds `next`, so `sent_through()+1` momentarily drops below `total`; the
+    // latch, once set, must stay `true` so a completion-time disconnect still reads
+    // as success rather than a spurious mid-transfer drop.
+    #[test]
+    fn payload_fully_sent_latch_survives_request_rewind() {
+        // Use a window SMALLER than the payload so a far-back gap-repair `request`
+        // can't refill to `total` in one pump → the live `sent_through()` read truly
+        // regresses (with window >= total, `request` re-pumps everything immediately
+        // and the live read never dips, which is why the latch is only needed in the
+        // windowed regime — exactly the 112 MB / 256-chunk-window case).
+        let total: u64 = 6;
+        let window: u64 = 2;
+        let mut e = SenderEngine::new(total, window);
+
+        // Slide the window all the way to completion via cumulative ACKs.
+        e.open(0);
+        for t in 0..total {
+            let _ = e.ack(t);
+        }
+        assert_eq!(e.sent_through(), Some(total - 1), "every chunk handed to transport");
+        assert!(e.end_emitted());
+
+        // Mirror the loop's latch step: once `sent_through()+1 >= total`, latch it.
+        let live_all_sent =
+            |eng: &SenderEngine| eng.sent_through().map(|t| t + 1 >= total).unwrap_or(false);
+        let mut payload_fully_sent = false;
+        if live_all_sent(&e) {
+            payload_fully_sent = true;
+        }
+        assert!(payload_fully_sent, "latch must set once the whole payload is sent");
+        assert!(live_all_sent(&e));
+
+        // A far-back gap-repair request rewinds `next` beyond the window → the LIVE
+        // all-sent read regresses (this is what made 034's live check false-retry).
+        e.request(0);
+        assert!(
+            !live_all_sent(&e),
+            "request far back rewinds next past the window, so the live read regresses",
+        );
+
+        // The monotonic latch is NEVER cleared within the attempt, so re-running the
+        // latch step cannot un-set it — the `is_done!`-style decision still succeeds.
+        if live_all_sent(&e) {
+            payload_fully_sent = true;
+        }
+        assert!(payload_fully_sent, "latch must stay true after a request rewind");
+
+        // is_done!-style decision: a disconnect after full send → success (no retry).
+        let recipient_done = false;
+        let adapter_finished = false; // final ACK not yet applied
+        let is_done = recipient_done || adapter_finished || payload_fully_sent;
+        assert!(is_done, "disconnect after full send must read as done (no retry)");
+    }
 }

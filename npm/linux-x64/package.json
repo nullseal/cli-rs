@@ -1,6 +1,6 @@
 {
   "name": "@nullseal/linux-x64",
-  "version": "0.15.3",
+  "version": "0.15.7",
   "description": "NullSeal CLI binary for Linux x64",
   "license": "MIT",
   "repository": {

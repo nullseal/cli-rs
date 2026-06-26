@@ -319,17 +319,111 @@ pub async fn run_local(
 
         let drop_at = if test_drop_armed { test_drop_after } else { None };
 
+        // Tracks whether the recipient signalled completion (p2p:complete /
+        // p2p:both-completed). Once set, a subsequent peer-disconnect / DC-close is
+        // expected teardown, not an interruption → finish success, never retry.
+        let mut recipient_done = false;
+
+        // Monotonic "entire payload handed to the transport" latch (task 037). Set
+        // once below when `engine_sent_through()+1 >= total_chunks`, and NEVER reset
+        // within this attempt — a per-attempt scope (re-entered on rejoin/`continue`)
+        // resets it to `false` on its own. See is_done! for why this must be a latch.
+        let mut payload_fully_sent = false;
+
+        // Single completion-decision shared by every disconnect/close site (task 034).
+        // A recipient disconnect at/after a full send resolves to SUCCESS if ANY of:
+        //   1. completion was already selected (`recipient_done`),
+        //   2. the adapter finished (final ACK applied),
+        //   3. a completion is pending now (drain `complete` / `both_completed`), or
+        //   4. the entire payload was handed to the transport — the recipient (web +
+        //      CLI) only disconnects after assembling+verifying the whole payload, so
+        //      "all sent + peer gone = done" sidesteps the ACK/`complete` timing race.
+        // (4) is read from the monotonic `payload_fully_sent` latch, NOT live from
+        // `engine_sent_through()`: a late tail gap-repair `request` rewinds the
+        // engine's `next` cursor, so the live value can momentarily dip below
+        // `total_chunks` after a full send and falsely read as a mid-transfer drop.
+        macro_rules! is_done {
+            () => {
+                recipient_done
+                    || adapter.is_finished()
+                    || control.events.complete.try_recv().is_ok()
+                    || control.events.both_completed.try_recv().is_ok()
+                    || payload_fully_sent
+            };
+        }
+
         // Drive the adapter: flush queued frames to WebRTC, consume ack/request.
         let send_result: Result<()> = async {
             loop {
+                // Latch "fully sent" as soon as every chunk has been handed to the
+                // transport — BEFORE the flush — so a send error or peer-disconnect
+                // during the final flush (the recipient tearing down at completion) is
+                // recognised as success, and a later gap-repair `request` that rewinds
+                // engine.next can't regress the signal. Never reset within the attempt.
+                // (Task 037)
+                if adapter
+                    .engine_sent_through()
+                    .map(|t| t + 1 >= total_chunks)
+                    .unwrap_or(false)
+                {
+                    payload_fully_sent = true;
+                }
+
                 let texts: Vec<String> = adapter.transport_mut().text_queue.drain(..).collect();
                 for t in texts {
-                    sender.send_frame(t).await?;
+                    // Interruptible flush: race the blocking send against a
+                    // peer-disconnect so a real drop aborts a stuck send promptly
+                    // instead of waiting for the ICE timeout.
+                    tokio::select! {
+                        biased;
+                        r = sender.send_frame(t) => {
+                            if let Err(e) = r {
+                                // The send loop closing right at completion (recipient
+                                // tore down after assembling everything) is expected
+                                // teardown, not a failure → success, no retry. (037)
+                                if is_done!() {
+                                    recipient_done = true;
+                                    break;
+                                }
+                                return Err(e);
+                            }
+                        }
+                        _ = control.events.peer_disconnected.recv() => {
+                            // The recv future has fired and is dropped before this body
+                            // runs, so the `try_recv`s inside is_done! are free to borrow
+                            // the (disjoint) complete/both_completed channels.
+                            if is_done!() {
+                                recipient_done = true;
+                                break;
+                            }
+                            super::log::step("Receiver disconnected — reconnecting…");
+                            return Err(anyhow::anyhow!("receiver disconnected"));
+                        }
+                    }
                 }
                 let bins: Vec<Vec<u8>> = adapter.transport_mut().binary_queue.drain(..).collect();
                 let bin_count = bins.len();
                 for b in bins {
-                    sender.send_binary(b).await?;
+                    tokio::select! {
+                        biased;
+                        r = sender.send_binary(b) => {
+                            if let Err(e) = r {
+                                if is_done!() {
+                                    recipient_done = true;
+                                    break;
+                                }
+                                return Err(e);
+                            }
+                        }
+                        _ = control.events.peer_disconnected.recv() => {
+                            if is_done!() {
+                                recipient_done = true;
+                                break;
+                            }
+                            super::log::step("Receiver disconnected — reconnecting…");
+                            return Err(anyhow::anyhow!("receiver disconnected"));
+                        }
+                    }
                 }
                 let sent_bytes = total_bytes.min(
                     (adapter.engine_sent_through().unwrap_or(0) as usize + 1) * chunk_size
@@ -360,6 +454,8 @@ pub async fn run_local(
                         if let Some(v) = val {
                             let through = v["through"].as_u64().unwrap_or(0);
                             adapter.on_ack(through);
+                            // Real progress after a (re)connect → reset the retry budget. (B1)
+                            if machine.attempts() > 0 { machine.handle(ConnEvent::TransferProgress); }
                         } else {
                             return Err(anyhow::anyhow!("control socket closed during transfer"));
                         }
@@ -376,7 +472,25 @@ pub async fn run_local(
                         if val.is_some() {
                             adapter.complete();
                         }
+                        recipient_done = true;
                         break;
+                    }
+                    _ = control.events.both_completed.recv() => {
+                        // Server's definitive "both done" signal → terminal success.
+                        adapter.complete();
+                        recipient_done = true;
+                        break;
+                    }
+                    _ = control.events.peer_disconnected.recv() => {
+                        // The recipient disconnecting AFTER it has the full payload is
+                        // expected teardown, not a failure → finish success, no retry.
+                        if is_done!() {
+                            break;
+                        }
+                        // Real mid-transfer drop — surface it at default level and
+                        // fall into the retry/rejoin path.
+                        super::log::step("Receiver disconnected — reconnecting…");
+                        return Err(anyhow::anyhow!("receiver disconnected"));
                     }
                     event = sender.next_event() => {
                         match event {
@@ -384,6 +498,9 @@ pub async fn run_local(
                                 return Err(anyhow::anyhow!("WebRTC error during transfer: {e}"));
                             }
                             Some(crate::webrtc::LoopEvent::Done) | None => {
+                                if is_done!() {
+                                    break;
+                                }
                                 return Err(anyhow::anyhow!("DataChannel closed during transfer"));
                             }
                             _ => {}
@@ -398,7 +515,6 @@ pub async fn run_local(
             if e.to_string().contains("test-induced drop") {
                 test_drop_armed = false; // fire once
             }
-            super::log::blank();
             // close_and_flush (awaited) guarantees the Close reaches the event loop
             // even when the cmd channel is full, so wait_closed can't hang.
             sender.close_and_flush().await;
@@ -414,7 +530,6 @@ pub async fn run_local(
         // 8. Cleanup — wait for the receiver's complete (011 handshake) → exit 0.
         sender.close_and_flush().await;
         sender.wait_closed().await;
-        super::log::blank();
         super::display::status("Transfer complete.");
         control.complete("sender", &content_checksum)?;
         return Ok(());
@@ -488,7 +603,8 @@ async fn run_server(
             challenge_metadata: challenge.challenge_metadata,
             content_checksum,
         })
-        .await?;
+        .await
+        .map_err(super::with_conn_hint)?;
 
     let share_url = match user_url() {
         Some(base) => format!("{}/s/{}", base.trim_end_matches('/'), resp.share_id),
@@ -527,7 +643,7 @@ async fn run_p2p(
 
     // 2. Create P2P session on the server
     super::log::event("creating session");
-    let session = client.create_p2p_session(&proof).await?;
+    let session = client.create_p2p_session(&proof).await.map_err(super::with_conn_hint)?;
     super::log::event(&format!("session created {}", session.session_id));
     let p2p_url = match user_url() {
         Some(base) => format!("{}/p2p/{}", base.trim_end_matches('/'), session.session_id),
@@ -756,18 +872,113 @@ async fn run_p2p(
         // Drive the adapter: flush queued frames to WebRTC, consume ack/request
         let total_bytes = bytes.len();
         let drop_at = if test_drop_armed { test_drop_after } else { None };
+
+        // Tracks whether the recipient signalled completion (p2p:complete /
+        // p2p:both-completed). Once set, a subsequent peer-disconnect / DC-close is
+        // expected teardown, not an interruption → finish success, never retry.
+        let mut recipient_done = false;
+
+        // Monotonic "entire payload handed to the transport" latch (task 037). Set
+        // once below when `engine_sent_through()+1 >= total_chunks`, and NEVER reset
+        // within this attempt — a per-attempt scope (re-entered on rejoin/`continue`)
+        // resets it to `false` on its own. See is_done! for why this must be a latch.
+        let mut payload_fully_sent = false;
+
+        // Single completion-decision shared by every disconnect/close site (task 034).
+        // A recipient disconnect at/after a full send resolves to SUCCESS if ANY of:
+        //   1. completion was already selected (`recipient_done`),
+        //   2. the adapter finished (final ACK applied),
+        //   3. a completion is pending now (drain `complete` / `both_completed`), or
+        //   4. the entire payload was handed to the transport — the recipient (web +
+        //      CLI) only disconnects after assembling+verifying the whole payload, so
+        //      "all sent + peer gone = done" sidesteps the ACK/`complete` timing race.
+        // (4) is read from the monotonic `payload_fully_sent` latch, NOT live from
+        // `engine_sent_through()`: a late tail gap-repair `request` rewinds the
+        // engine's `next` cursor, so the live value can momentarily dip below
+        // `total_chunks` after a full send and falsely read as a mid-transfer drop.
+        macro_rules! is_done {
+            () => {
+                recipient_done
+                    || adapter.is_finished()
+                    || control.events.complete.try_recv().is_ok()
+                    || control.events.both_completed.try_recv().is_ok()
+                    || payload_fully_sent
+            };
+        }
+
         let send_result: Result<()> = async {
             loop {
+                // Latch "fully sent" as soon as every chunk has been handed to the
+                // transport — BEFORE the flush — so a send error or peer-disconnect
+                // during the final flush (the recipient tearing down at completion) is
+                // recognised as success, and a later gap-repair `request` that rewinds
+                // engine.next can't regress the signal. Never reset within the attempt.
+                // (Task 037)
+                if adapter
+                    .engine_sent_through()
+                    .map(|t| t + 1 >= total_chunks)
+                    .unwrap_or(false)
+                {
+                    payload_fully_sent = true;
+                }
+
                 // Flush text frames
                 let texts: Vec<String> = adapter.transport_mut().text_queue.drain(..).collect();
                 for t in texts {
-                    sender.send_frame(t).await?;
+                    // Interruptible flush: race the blocking send against a
+                    // peer-disconnect so a real drop aborts a stuck send promptly
+                    // instead of waiting for the ICE timeout.
+                    tokio::select! {
+                        biased;
+                        r = sender.send_frame(t) => {
+                            if let Err(e) = r {
+                                // The send loop closing right at completion (recipient
+                                // tore down after assembling everything) is expected
+                                // teardown, not a failure → success, no retry. (037)
+                                if is_done!() {
+                                    recipient_done = true;
+                                    break;
+                                }
+                                return Err(e);
+                            }
+                        }
+                        _ = control.events.peer_disconnected.recv() => {
+                            // The recv future has fired and is dropped before this body
+                            // runs, so the `try_recv`s inside is_done! are free to borrow
+                            // the (disjoint) complete/both_completed channels.
+                            if is_done!() {
+                                recipient_done = true;
+                                break;
+                            }
+                            super::log::step("Receiver disconnected — reconnecting…");
+                            return Err(anyhow::anyhow!("receiver disconnected"));
+                        }
+                    }
                 }
                 // Flush binary frames
                 let bins: Vec<Vec<u8>> = adapter.transport_mut().binary_queue.drain(..).collect();
                 let bin_count = bins.len();
                 for b in bins {
-                    sender.send_binary(b).await?;
+                    tokio::select! {
+                        biased;
+                        r = sender.send_binary(b) => {
+                            if let Err(e) = r {
+                                if is_done!() {
+                                    recipient_done = true;
+                                    break;
+                                }
+                                return Err(e);
+                            }
+                        }
+                        _ = control.events.peer_disconnected.recv() => {
+                            if is_done!() {
+                                recipient_done = true;
+                                break;
+                            }
+                            super::log::step("Receiver disconnected — reconnecting…");
+                            return Err(anyhow::anyhow!("receiver disconnected"));
+                        }
+                    }
                 }
                 let sent_bytes = total_bytes.min(
                     (adapter.engine_sent_through().unwrap_or(0) as usize + 1) * chunk_size
@@ -799,6 +1010,8 @@ async fn run_p2p(
                         if let Some(v) = val {
                             let through = v["through"].as_u64().unwrap_or(0);
                             adapter.on_ack(through);
+                            // Real progress after a (re)connect → reset the retry budget. (B1)
+                            if machine.attempts() > 0 { machine.handle(ConnEvent::TransferProgress); }
                         } else {
                             break; // socket closed
                         }
@@ -815,7 +1028,25 @@ async fn run_p2p(
                         if val.is_some() {
                             adapter.complete();
                         }
+                        recipient_done = true;
                         break;
+                    }
+                    _ = control.events.both_completed.recv() => {
+                        // Server's definitive "both done" signal → terminal success.
+                        adapter.complete();
+                        recipient_done = true;
+                        break;
+                    }
+                    _ = control.events.peer_disconnected.recv() => {
+                        // The recipient disconnecting AFTER it has the full payload is
+                        // expected teardown, not a failure → finish success, no retry.
+                        if is_done!() {
+                            break;
+                        }
+                        // Real mid-transfer drop — surface it at default level and
+                        // fall into the retry/rejoin path.
+                        super::log::step("Receiver disconnected — reconnecting…");
+                        return Err(anyhow::anyhow!("receiver disconnected"));
                     }
                     event = sender.next_event() => {
                         match event {
@@ -823,6 +1054,9 @@ async fn run_p2p(
                                 return Err(anyhow::anyhow!("WebRTC error during transfer: {e}"));
                             }
                             Some(crate::webrtc::LoopEvent::Done) | None => {
+                                if is_done!() {
+                                    break;
+                                }
                                 return Err(anyhow::anyhow!("DataChannel closed during transfer"));
                             }
                             _ => {}
@@ -837,7 +1071,6 @@ async fn run_p2p(
             if e.to_string().contains("test-induced drop") {
                 test_drop_armed = false; // fire once
             }
-            super::log::blank();
             sender.close();
             sender.wait_closed().await;
             machine_retry!(
@@ -852,7 +1085,6 @@ async fn run_p2p(
         sender.close_and_flush().await;
         sender.wait_closed().await;
 
-        super::log::blank();
         super::display::status("Transfer complete.");
 
         control.complete("sender", &content_checksum)?;
@@ -1034,7 +1266,9 @@ mod tests {
         let err = run("hello", "password", "u", "txt", Some(url), None, true, false, &mut |_| {})
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("Request failed"));
+        let msg = err.to_string();
+        assert!(msg.contains("500"), "expected status in error, got: {msg}");
+        assert!(msg.contains("/shares"), "expected url path in error, got: {msg}");
     }
 
     // ── validate ─────────────────────────────────────────────────────────

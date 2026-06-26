@@ -104,7 +104,7 @@ async fn run_server(
 
     // Step 1: fetch metadata (includes encrypted challenge + verifyId)
     super::log::event(&format!("fetching metadata for share {share_id}"));
-    let metadata = client.get_share_metadata(share_id).await?;
+    let metadata = client.get_share_metadata(share_id).await.map_err(super::with_conn_hint)?;
 
     // Step 2: decrypt challenge to prove password knowledge
     super::log::event("verifying password (challenge)");
@@ -162,9 +162,16 @@ async fn run_p2p(
 
     // 1. Check session status
     super::log::event(&format!("joining session {session_id} as recipient"));
-    let session = client.get_p2p_session(session_id).await?;
+    let session = client.get_p2p_session(session_id).await.map_err(super::with_conn_hint)?;
     if session.status == "expired" {
         bail!("Session is expired or unavailable.");
+    }
+    // A finished/completed/deleted session is terminal: the one-shot transfer is
+    // over, so refuse to join (otherwise the receiver hangs at "Waiting for
+    // sender…"). Belt-and-suspenders — the server also reports a finished session
+    // as unavailable (404) from GET /p2p/sessions/:id. (Task 031)
+    if matches!(session.status.as_str(), "finished" | "completed" | "deleted") {
+        bail!("Session is no longer available.");
     }
 
     // 2. Verify password
@@ -214,6 +221,14 @@ async fn run_p2p(
     machine.handle(ConnEvent::Start);
     machine.handle(ConnEvent::SocketUp);
     machine.handle(ConnEvent::Joined { last_chunk_offset: 0, generation: 0 });
+    let chunk_size = crate::crypto::STREAM_CHUNK_SIZE;
+
+    // Preserved across reconnects so we resume instead of restarting. (Bug 024-B —
+    // mirrors run_local: these used to live inside the per-iteration async block and
+    // reset to empty on every reconnect, restarting the progress bar.)
+    let mut plaintext_buf: Vec<u8> = Vec::new();
+    let mut content_type = String::new();
+    let mut file_meta: Option<serde_json::Value> = None;
 
     // Helper: reconnect socket if dead, then emit join
     macro_rules! rejoin {
@@ -255,9 +270,17 @@ async fn run_p2p(
         }};
     }
 
+    // Drain stale buffered offer/ice on every RE-attempt, not just auto-retries.
+    // A manual retry resets `attempts()` to 0, so gating the drain on
+    // `attempts() > 0` let a stale offer (buffered from the sender's pre-stop
+    // attempts) slip through → receiver built against a dead PC → "channel open
+    // failed". Gate on `connected_once` instead: the initial connect waits for
+    // the first offer (no drain), and every later attempt (auto OR manual)
+    // clears stale signals first. (Task 027 Bug B)
+    let mut connected_once = false;
     loop {
         // 6b. Wait for SDP offer from sender.
-        if machine.attempts() > 0 {
+        if connected_once {
             while control.events.offer.try_recv().is_ok() {}
             while control.events.ice.try_recv().is_ok() {}
         }
@@ -298,15 +321,17 @@ async fn run_p2p(
 
         // DataChannel open → machine resets the retry budget (Transferring phase).
         machine.handle(ConnEvent::DcOpen);
+        // We've truly connected at least once → every subsequent attempt must
+        // drain stale buffered offer/ice before awaiting a fresh one. (Task 027 Bug B)
+        connected_once = true;
 
-        super::log::step("Transfer started…");
+        super::log::step("Transferring…");
 
         // 9. Receive v2 binary transfer: wait for metadata string frame, then
         //    route binary frames through ReceiverAdapter.
         use crate::crypto::{StreamDecryptor, StreamEncryptionMetadata};
         use crate::p2p::receiver_adapter::{AdapterOutput, ReceiverAdapter, ReceiverDecryptorT, ReceiverTransport};
         use crate::p2p::receiver_engine::ReceiverEngine;
-        use sha2::{Digest, Sha256};
 
         struct CtrlTransport<'a, T: nullseal_p2p_control::transport::ControlTransport> {
             control: &'a P2PControl<T>,
@@ -328,19 +353,32 @@ async fn run_p2p(
             }
         }
 
-        // Wait for metadata (first text frame from DC) + setup adapter
-        let transfer_result: Result<(Vec<u8>, String, Option<serde_json::Value>, String)> = async {
-            let mut content_type = String::new();
-            let mut file_meta: Option<serde_json::Value> = None;
+        // Surface a peer-disconnect during transfer (task 022). The adapter borrows
+        // `&control` for the whole block, so we can't also `&mut control.events` here;
+        // move the (otherwise-unconsumed) peer_disconnected receiver into a local to
+        // poll it in the select, and restore it after the block.
+        let (_pd_dummy_tx, pd_dummy_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+        let mut peer_disconnected = std::mem::replace(&mut control.events.peer_disconnected, pd_dummy_rx);
+
+        // Wait for metadata (first text frame from DC) + setup adapter. The
+        // plaintext we've already committed (and content_type/file_meta) live in the
+        // outer scope so they survive reconnects; on (re)connect we truncate to the
+        // sender's resume point and decrypt forward from there. (Bug 024-B)
+        let transfer_result: Result<String> = async {
             let mut content_checksum_expected = String::new();
-            let mut plaintext_buf: Vec<u8> = Vec::new();
-            let mut hasher = Sha256::new();
             let mut adapter_opt: Option<ReceiverAdapter<CtrlTransport<'_, _>, RealDecryptor>> = None;
             let mut total_plaintext_size: usize = 0;
 
             loop {
                 tokio::select! {
                     biased;
+                    _ = peer_disconnected.recv() => {
+                        // Default-level so the user sees the cause (the retry line's
+                        // technical reason is verbose-only since task 030). Mirrors the
+                        // sender-side "Receiver disconnected" (task 032). (task 035)
+                        super::log::step("Sender disconnected — reconnecting…");
+                        return Err(anyhow::anyhow!("sender disconnected"));
+                    }
                     event = receiver.next_event() => {
                         match event {
                             Some(crate::webrtc::LoopEvent::Message(text)) => {
@@ -375,6 +413,15 @@ async fn run_p2p(
                                     super::format_size(total_plaintext_size),
                                 ));
 
+                                // Truncate any committed plaintext to the sender's resume
+                                // point (mirrors run_local / the web recipient's
+                                // `slice(0, resumeFrom)`), so a re-sent chunk isn't
+                                // double-counted on resume. (Bug 024-B)
+                                let keep = (resume_from as usize)
+                                    .saturating_mul(chunk_size)
+                                    .min(plaintext_buf.len());
+                                plaintext_buf.truncate(keep);
+
                                 let mut decryptor = StreamDecryptor::from_metadata(&stream_meta, password)
                                     .map_err(|e| anyhow::anyhow!("failed to init decryptor: {e}"))?;
                                 if resume_from > 0 {
@@ -396,8 +443,9 @@ async fn run_p2p(
                                     for out in outputs {
                                         match out {
                                             AdapterOutput::Deliver { index, plaintext } => {
-                                                hasher.update(&plaintext);
                                                 plaintext_buf.extend_from_slice(&plaintext);
+                                                // Real progress after a (re)connect → reset the retry budget. (B1)
+                                                if machine.attempts() > 0 { machine.handle(ConnEvent::TransferProgress); }
                                                 super::log::event(&format!(
                                                     "received chunk {index} ({}) — {} / {}",
                                                     super::format_size(plaintext.len()),
@@ -407,14 +455,16 @@ async fn run_p2p(
                                                 super::display::receive_progress(plaintext_buf.len(), total_plaintext_size);
                                             }
                                             AdapterOutput::Complete => {
-                                                // Verify checksum
-                                                let computed = format!("{:x}", hasher.clone().finalize());
+                                                // Hash the fully assembled buffer (resume-safe;
+                                                // chunks may have been re-sent on reconnect, so an
+                                                // incremental hash would double-count). (Bug 024-B)
+                                                let computed = sha256_bytes(&plaintext_buf);
                                                 if !content_checksum_expected.is_empty() && computed != content_checksum_expected {
                                                     return Err(anyhow::anyhow!(
                                                         "Checksum mismatch: expected {content_checksum_expected}, got {computed}"
                                                     ));
                                                 }
-                                                return Ok((plaintext_buf, content_type, file_meta, computed));
+                                                return Ok(computed);
                                             }
                                             _ => {}
                                         }
@@ -434,12 +484,16 @@ async fn run_p2p(
             }
         }.await;
 
+        // Restore the peer_disconnected receiver so it keeps routing across a reuse
+        // (is_alive) rejoin on the same control. (task 022)
+        control.events.peer_disconnected = peer_disconnected;
+
         match transfer_result {
-            Ok((plaintext, content_type, file_meta, checksum)) => {
+            Ok(checksum) => {
                 super::log::blank();
                 super::display::status(&format!(
                     "Received & decrypted ({})",
-                    super::format_size(plaintext.len())
+                    super::format_size(plaintext_buf.len())
                 ));
 
                 // 10. Output
@@ -451,13 +505,13 @@ async fn run_p2p(
                         let dir = output_dir.unwrap_or(".");
                         let filepath = super::deduplicate_path(PathBuf::from(dir).join(filename));
                         confirm_unsafe_file(filename)?;
-                        std::fs::write(&filepath, &plaintext)?;
+                        std::fs::write(&filepath, &plaintext_buf)?;
                         super::log::step(&format!("Saved: {}", filepath.display()));
                     } else {
-                        log(std::str::from_utf8(&plaintext).unwrap_or("(binary data)"));
+                        log(std::str::from_utf8(&plaintext_buf).unwrap_or("(binary data)"));
                     }
                 } else {
-                    log(std::str::from_utf8(&plaintext).unwrap_or("(binary data)"));
+                    log(std::str::from_utf8(&plaintext_buf).unwrap_or("(binary data)"));
                 }
 
                 // 11. Emit complete + wait for session deletion, then cleanup
@@ -637,7 +691,11 @@ pub async fn run_local(
             continue;
         }
         machine.handle(ConnEvent::DcOpen);
-        super::log::step("Transfer started…");
+        super::log::step("Transferring…");
+
+        // Surface a peer-disconnect during transfer (task 022) — see run_p2p.
+        let (_pd_dummy_tx, pd_dummy_rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+        let mut peer_disconnected = std::mem::replace(&mut control.events.peer_disconnected, pd_dummy_rx);
 
         // 7. Receive v2 binary transfer with windowed-ACK control plane. The
         //    plaintext we've already committed is kept; on (re)connect we truncate
@@ -648,7 +706,18 @@ pub async fn run_local(
             let mut total_plaintext_size: usize = 0;
 
             loop {
-                match receiver.next_event().await {
+                let event = tokio::select! {
+                    biased;
+                    _ = peer_disconnected.recv() => {
+                        // Default-level so the user sees the cause (the retry line's
+                        // technical reason is verbose-only since task 030). Mirrors the
+                        // sender-side "Receiver disconnected" (task 032). (task 035)
+                        super::log::step("Sender disconnected — reconnecting…");
+                        return Err(anyhow::anyhow!("sender disconnected"));
+                    }
+                    ev = receiver.next_event() => ev,
+                };
+                match event {
                     Some(crate::webrtc::LoopEvent::Message(text)) => {
                         let v: serde_json::Value = match serde_json::from_str(&text) {
                             Ok(v) => v,
@@ -708,6 +777,8 @@ pub async fn run_local(
                                 match out {
                                     AdapterOutput::Deliver { index, plaintext } => {
                                         plaintext_buf.extend_from_slice(&plaintext);
+                                        // Real progress after a (re)connect → reset the retry budget. (B1)
+                                        if machine.attempts() > 0 { machine.handle(ConnEvent::TransferProgress); }
                                         super::log::event(&format!(
                                             "received chunk {index} ({}) — {} / {}",
                                             super::format_size(plaintext.len()),
@@ -742,6 +813,9 @@ pub async fn run_local(
                 }
             }
         }.await;
+
+        // Restore the peer_disconnected receiver (see run_p2p). (task 022)
+        control.events.peer_disconnected = peer_disconnected;
 
         match transfer_result {
             Ok(checksum) => {
@@ -1068,6 +1142,25 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("expired"));
+    }
+
+    #[tokio::test]
+    async fn p2p_finished_session_errors_before_verify() {
+        // Task 031: a finished session must be rejected up front (belt-and-suspenders
+        // alongside the server's 404), not let the receiver reach "Waiting for sender".
+        let (server, url) = mock_server().await;
+        Mock::given(method("GET"))
+            .and(path("/p2p/sessions/sfin"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "sessionId": "sfin", "status": "finished", "expiresAt": ""
+            })))
+            .mount(&server)
+            .await;
+
+        let err = run("https://nullseal.com/p2p/sfin", "password", None, Some(url), false, &mut |_| {})
+            .await
+            .unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("no longer available"));
     }
 
     #[tokio::test]

@@ -1,9 +1,25 @@
+pub mod check;
 pub mod display;
 pub mod get;
 pub mod log;
 pub mod manage;
 pub mod p2p_stages;
 pub mod share;
+
+/// Map an `ApiError` from a first server call to an anyhow error, appending an
+/// actionable connectivity hint ONLY for connection-class failures (couldn't
+/// reach the server, or it returned a non-2xx). Genuine "share not found /
+/// destroyed" (`ShareUnavailable`) passes through without the hint, so we don't
+/// wrongly suggest a server misconfiguration. (task 026)
+pub(crate) fn with_conn_hint(e: crate::api::ApiError) -> anyhow::Error {
+    use crate::api::ApiError;
+    match &e {
+        ApiError::RequestFailed { .. } | ApiError::Network(_) => anyhow::anyhow!(
+            "{e}\nHint: run `nullseal check server` to diagnose connectivity (add -s <url> if you use a custom server)."
+        ),
+        _ => anyhow::anyhow!("{e}"),
+    }
+}
 
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     // text & data

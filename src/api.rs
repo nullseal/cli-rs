@@ -14,8 +14,8 @@ pub enum ApiError {
     WrongPassword,
     #[error("Verify session expired, please retry")]
     VerifyExpired,
-    #[error("Request failed")]
-    RequestFailed,
+    #[error("server returned HTTP {status} for {url}")]
+    RequestFailed { status: u16, url: String },
     #[error("Network error: {0}")]
     Network(#[from] reqwest::Error),
 }
@@ -185,15 +185,16 @@ impl ApiClient {
         &self,
         payload: CreateShareRequest,
     ) -> Result<CreateShareResponse, ApiError> {
+        let url = self.url("/shares");
         let resp = self
             .client
-            .post(self.url("/shares"))
+            .post(&url)
             .json(&payload)
             .send()
             .await?;
 
         if !resp.status().is_success() {
-            return Err(ApiError::RequestFailed);
+            return Err(ApiError::RequestFailed { status: resp.status().as_u16(), url });
         }
         Ok(resp.json().await?)
     }
@@ -202,18 +203,19 @@ impl ApiClient {
         &self,
         share_id: &str,
     ) -> Result<ShareMetadataResponse, ApiError> {
+        let url = self.url(&format!(
+            "/shares/{}/metadata",
+            urlencoding::encode(share_id)
+        ));
         let resp = self
             .client
-            .get(self.url(&format!(
-                "/shares/{}/metadata",
-                urlencoding::encode(share_id)
-            )))
+            .get(&url)
             .send()
             .await?;
 
         match resp.status() {
             StatusCode::NOT_FOUND => return Err(ApiError::ShareUnavailable),
-            s if !s.is_success() => return Err(ApiError::RequestFailed),
+            s if !s.is_success() => return Err(ApiError::RequestFailed { status: s.as_u16(), url }),
             _ => {}
         }
         Ok(resp.json().await?)
@@ -225,12 +227,13 @@ impl ApiClient {
         answer: &str,
         verify_id: &str,
     ) -> Result<SharePayloadResponse, ApiError> {
+        let url = self.url(&format!(
+            "/shares/{}/payload",
+            urlencoding::encode(share_id)
+        ));
         let resp = self
             .client
-            .post(self.url(&format!(
-                "/shares/{}/payload",
-                urlencoding::encode(share_id)
-            )))
+            .post(&url)
             .json(&serde_json::json!({
                 "answer": answer,
                 "verifyId": verify_id
@@ -241,14 +244,15 @@ impl ApiClient {
         match resp.status() {
             StatusCode::NOT_FOUND => return Err(ApiError::ShareUnavailable),
             StatusCode::FORBIDDEN => {
+                let status = resp.status().as_u16();
                 let body: serde_json::Value = resp.json().await.unwrap_or_default();
                 match body["message"].as_str() {
                     Some("wrong_password") => return Err(ApiError::WrongPassword),
                     Some("verify_expired") => return Err(ApiError::VerifyExpired),
-                    _ => return Err(ApiError::RequestFailed),
+                    _ => return Err(ApiError::RequestFailed { status, url }),
                 }
             }
-            s if !s.is_success() => return Err(ApiError::RequestFailed),
+            s if !s.is_success() => return Err(ApiError::RequestFailed { status: s.as_u16(), url }),
             _ => {}
         }
         Ok(resp.json().await?)
@@ -258,15 +262,16 @@ impl ApiClient {
         &self,
         password_proof: &str,
     ) -> Result<CreateP2PSessionResponse, ApiError> {
+        let url = self.url("/p2p/sessions");
         let resp = self
             .client
-            .post(self.url("/p2p/sessions"))
+            .post(&url)
             .json(&serde_json::json!({ "passwordProof": password_proof }))
             .send()
             .await?;
 
         if !resp.status().is_success() {
-            return Err(ApiError::RequestFailed);
+            return Err(ApiError::RequestFailed { status: resp.status().as_u16(), url });
         }
         Ok(resp.json().await?)
     }
@@ -276,12 +281,13 @@ impl ApiClient {
         session_id: &str,
         proof: &str,
     ) -> Result<(), P2PVerifyError> {
+        let url = self.url(&format!(
+            "/p2p/sessions/{}/verify",
+            urlencoding::encode(session_id)
+        ));
         let resp = self
             .client
-            .post(self.url(&format!(
-                "/p2p/sessions/{}/verify",
-                urlencoding::encode(session_id)
-            )))
+            .post(&url)
             .json(&serde_json::json!({ "proof": proof }))
             .send()
             .await
@@ -291,7 +297,8 @@ impl ApiClient {
             return Ok(());
         }
 
-        match resp.status() {
+        let status = resp.status();
+        match status {
             StatusCode::UNAUTHORIZED | StatusCode::TOO_MANY_REQUESTS => {
                 let body: VerifyErrorBody =
                     resp.json().await.unwrap_or(VerifyErrorBody { code: None, attempts_left: None });
@@ -302,35 +309,37 @@ impl ApiClient {
                     _ => Err(P2PVerifyError::IpBlocked),
                 }
             }
-            _ => Err(P2PVerifyError::Api(ApiError::RequestFailed)),
+            _ => Err(P2PVerifyError::Api(ApiError::RequestFailed { status: status.as_u16(), url })),
         }
     }
 
     pub async fn get_p2p_session(&self, session_id: &str) -> Result<P2PSession, ApiError> {
+        let url = self.url(&format!(
+            "/p2p/sessions/{}",
+            urlencoding::encode(session_id)
+        ));
         let resp = self
             .client
-            .get(self.url(&format!(
-                "/p2p/sessions/{}",
-                urlencoding::encode(session_id)
-            )))
+            .get(&url)
             .send()
             .await?;
 
         if !resp.status().is_success() {
-            return Err(ApiError::RequestFailed);
+            return Err(ApiError::RequestFailed { status: resp.status().as_u16(), url });
         }
         Ok(resp.json().await?)
     }
 
     pub async fn get_ice_servers(&self) -> Result<Vec<IceServer>, ApiError> {
+        let url = self.url("/p2p/ice-servers");
         let resp = self
             .client
-            .get(self.url("/p2p/ice-servers"))
+            .get(&url)
             .send()
             .await?;
 
         if !resp.status().is_success() {
-            return Err(ApiError::RequestFailed);
+            return Err(ApiError::RequestFailed { status: resp.status().as_u16(), url });
         }
         Ok(resp.json().await?)
     }
@@ -340,9 +349,10 @@ impl ApiClient {
         share_id: &str,
         owner_code: &str,
     ) -> Result<VerifyOwnerResponse, ApiError> {
+        let url = self.url("/shares/manage/verify");
         let resp = self
             .client
-            .post(self.url("/shares/manage/verify"))
+            .post(&url)
             .json(&serde_json::json!({
                 "shareId": share_id,
                 "ownerCode": owner_code
@@ -352,8 +362,8 @@ impl ApiClient {
 
         match resp.status() {
             StatusCode::NOT_FOUND => return Err(ApiError::ShareUnavailable),
-            StatusCode::FORBIDDEN => return Err(ApiError::RequestFailed),
-            s if !s.is_success() => return Err(ApiError::RequestFailed),
+            StatusCode::FORBIDDEN => return Err(ApiError::RequestFailed { status: StatusCode::FORBIDDEN.as_u16(), url }),
+            s if !s.is_success() => return Err(ApiError::RequestFailed { status: s.as_u16(), url }),
             _ => {}
         }
         Ok(resp.json().await?)
@@ -364,20 +374,21 @@ impl ApiClient {
         share_id: &str,
         payload: ReplaceShareRequest,
     ) -> Result<(), ApiError> {
+        let url = self.url(&format!(
+            "/shares/{}",
+            urlencoding::encode(share_id)
+        ));
         let resp = self
             .client
-            .put(self.url(&format!(
-                "/shares/{}",
-                urlencoding::encode(share_id)
-            )))
+            .put(&url)
             .json(&payload)
             .send()
             .await?;
 
         match resp.status() {
             StatusCode::NOT_FOUND => return Err(ApiError::ShareUnavailable),
-            StatusCode::FORBIDDEN => return Err(ApiError::RequestFailed),
-            s if !s.is_success() => return Err(ApiError::RequestFailed),
+            StatusCode::FORBIDDEN => return Err(ApiError::RequestFailed { status: StatusCode::FORBIDDEN.as_u16(), url }),
+            s if !s.is_success() => return Err(ApiError::RequestFailed { status: s.as_u16(), url }),
             _ => {}
         }
         Ok(())
@@ -388,20 +399,21 @@ impl ApiClient {
         share_id: &str,
         owner_code: &str,
     ) -> Result<(), ApiError> {
+        let url = self.url(&format!(
+            "/shares/{}",
+            urlencoding::encode(share_id)
+        ));
         let resp = self
             .client
-            .delete(self.url(&format!(
-                "/shares/{}",
-                urlencoding::encode(share_id)
-            )))
+            .delete(&url)
             .json(&serde_json::json!({ "ownerCode": owner_code }))
             .send()
             .await?;
 
         match resp.status() {
             StatusCode::NOT_FOUND => return Err(ApiError::ShareUnavailable),
-            StatusCode::FORBIDDEN => return Err(ApiError::RequestFailed),
-            s if !s.is_success() => return Err(ApiError::RequestFailed),
+            StatusCode::FORBIDDEN => return Err(ApiError::RequestFailed { status: StatusCode::FORBIDDEN.as_u16(), url }),
+            s if !s.is_success() => return Err(ApiError::RequestFailed { status: s.as_u16(), url }),
             _ => {}
         }
         Ok(())
@@ -411,17 +423,18 @@ impl ApiClient {
         &self,
         share_id: &str,
     ) -> Result<(), ApiError> {
+        let url = self.url(&format!(
+            "/shares/{}/report-malformed",
+            urlencoding::encode(share_id)
+        ));
         let resp = self
             .client
-            .post(self.url(&format!(
-                "/shares/{}/report-malformed",
-                urlencoding::encode(share_id)
-            )))
+            .post(&url)
             .send()
             .await?;
 
         if !resp.status().is_success() {
-            return Err(ApiError::RequestFailed);
+            return Err(ApiError::RequestFailed { status: resp.status().as_u16(), url });
         }
         Ok(())
     }
@@ -506,7 +519,10 @@ mod tests {
             .await;
 
         let err = client.get_share_payload("s1", "answer", "vid").await.unwrap_err();
-        assert!(matches!(err, ApiError::RequestFailed));
+        assert!(matches!(err, ApiError::RequestFailed { status: 500, .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("500"), "expected status in error, got: {msg}");
+        assert!(msg.contains("/shares/s1/payload"), "expected url in error, got: {msg}");
     }
 
     #[tokio::test]
@@ -571,6 +587,22 @@ mod tests {
         let session = client.get_p2p_session("sess3").await.unwrap();
         assert_eq!(session.session_id, "sess3");
         assert_eq!(session.status, "waiting");
+    }
+
+    #[tokio::test]
+    async fn get_p2p_session_404_carries_status_and_url() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/p2p/sessions/missing"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let err = client.get_p2p_session("missing").await.unwrap_err();
+        assert!(matches!(err, ApiError::RequestFailed { status: 404, .. }));
+        let msg = err.to_string();
+        assert!(msg.contains("404"), "expected status in error, got: {msg}");
+        assert!(msg.contains("/p2p/sessions/"), "expected path in error, got: {msg}");
     }
 
     #[tokio::test]

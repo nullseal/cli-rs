@@ -18,7 +18,7 @@
 //! target stream is not a TTY (piped output), independent of the mode.
 
 use std::io::{IsTerminal, Write};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// Output verbosity, derived from the `--pipe` / `--verbose` flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +50,18 @@ impl Verbosity {
 
 // Default to Normal until `init` is called (keeps unit tests / early errors sane).
 static VERBOSITY: AtomicU8 = AtomicU8::new(1);
+
+// True while a live (TTY, `\r`-rewritten) progress line is pending without a
+// trailing newline. Any other stderr write must terminate it first so messages
+// don't run on (e.g. "Sending: 25 MB/112 MBReceiver disconnected…"). (task 033)
+static PROGRESS_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// If a live progress line is pending, end it with a newline before other output.
+fn finish_progress() {
+    if PROGRESS_ACTIVE.swap(false, Ordering::Relaxed) {
+        eprintln!();
+    }
+}
 
 /// Set the process-global verbosity from the parsed flags. Call once in `main`.
 pub fn init(verbosity: Verbosity) {
@@ -88,6 +100,7 @@ pub fn blank() {
     if is_pipe() {
         return;
     }
+    finish_progress();
     eprintln!();
 }
 
@@ -97,18 +110,35 @@ pub fn step(s: &str) {
     if is_pipe() {
         return;
     }
+    finish_progress();
     eprintln!("{s}");
 }
 
+/// Format the retry-attempt line. The technical `reason` is appended only in
+/// Verbose; Normal shows a clean `Connection interrupted, retrying (n/max)`.
+/// (Pure — for testing.)
+fn format_attempt(n: u32, max: u32, reason: &str, verbose: bool) -> String {
+    if verbose {
+        format!("Connection interrupted, retrying ({n}/{max}) — {reason}")
+    } else {
+        format!("Connection interrupted, retrying ({n}/{max})")
+    }
+}
+
 /// A retry attempt notice. Shown in Normal + Verbose; suppressed in Pipe.
+/// The technical `reason` (e.g. "transfer interrupted: DataChannel closed…") is
+/// only shown in **Verbose** — Normal stays a clean
+/// `Connection interrupted, retrying (n/max)`.
 pub fn attempt(n: u32, max: u32, reason: &str) {
     if is_pipe() {
         return;
     }
+    finish_progress();
+    let line = format_attempt(n, max, reason, is_verbose());
     if stderr_is_tty() {
-        eprintln!("\x1b[1;33m⟳\x1b[0m Retrying ({n}/{max}) — {reason}");
+        eprintln!("\x1b[1;33m⟳\x1b[0m {line}");
     } else {
-        eprintln!("Retrying ({n}/{max}) — {reason}");
+        eprintln!("{line}");
     }
 }
 
@@ -117,6 +147,7 @@ pub fn event(s: &str) {
     if !is_verbose() {
         return;
     }
+    finish_progress();
     if stderr_is_tty() {
         eprintln!("\x1b[2m·\x1b[0m {s}");
     } else {
@@ -130,6 +161,7 @@ pub fn error(s: &str) {
     if is_pipe() {
         return;
     }
+    finish_progress();
     if stderr_is_tty() {
         eprintln!("\x1b[1;31m✗\x1b[0m {s}");
     } else {
@@ -159,6 +191,14 @@ fn progress(label: &str, done: usize, total: usize) {
         // Overwrite the current line with the live counter.
         let _ = write!(err, "\r{label}: {done}/{total}\x1b[K");
         let _ = err.flush();
+        // A live line is now pending (no trailing newline) — mark it so the next
+        // non-progress write terminates it. On the final tick, end it here. (task 033)
+        if done == total {
+            let _ = writeln!(err);
+            PROGRESS_ACTIVE.store(false, Ordering::Relaxed);
+        } else {
+            PROGRESS_ACTIVE.store(true, Ordering::Relaxed);
+        }
     } else {
         // Non-TTY: emit one line per update would flood; only emit at the end
         // (done == total) so piped logs stay readable without ANSI rewrites.
@@ -182,6 +222,19 @@ mod tests {
     #[test]
     fn unknown_u8_defaults_to_normal() {
         assert_eq!(Verbosity::from_u8(99), Verbosity::Normal);
+    }
+
+    #[test]
+    fn attempt_reason_only_in_verbose() {
+        // Normal: clean line, no technical reason. Verbose: full reason. (Task 030)
+        assert_eq!(
+            format_attempt(1, 3, "DataChannel closed", false),
+            "Connection interrupted, retrying (1/3)"
+        );
+        assert_eq!(
+            format_attempt(1, 3, "DataChannel closed", true),
+            "Connection interrupted, retrying (1/3) — DataChannel closed"
+        );
     }
 
     #[test]

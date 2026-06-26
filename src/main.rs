@@ -41,11 +41,20 @@ mod webrtc;
   -c, --command <CMD>    Action: replace | destroy
       --replace          Replace share content (shorthand for -c replace)
       --destroy          Destroy share permanently (shorthand for -c destroy)
+  -y, --yes              Skip the destroy confirmation prompt (for scripts)
   -p, --password <PW>    Encryption password (required for replace)
       --text             Replace with text content (default)
       --file             Replace with file content
       --pwd              Replace with a password-type secret
   -t, --type <TYPE>      Type alias: txt | file | pwd (must match original)
+
+\x1b[1;4mCheck options:\x1b[0m
+  nullseal check server          Full backend diagnostic (config, DNS, TCP/TLS,
+                                 web, core API, create-session, signaling, STUN, TURN)
+  nullseal check turn            STUN/TURN reachability subset (is UDP/relay blocked?)
+  -s, --server <URL>             Override core API base (default: CLI_APPS_CORE_URL)
+      --verbose                  Full per-probe checklist + IPs/URLs/srflx/relayed-addr
+  Exit 0 only when the critical checks pass; non-zero otherwise.
 
 \x1b[1;4mExamples:\x1b[0m
   nullseal share \"hello world\" -p mypass
@@ -58,7 +67,11 @@ mod webrtc;
   nullseal get <URL> -p mypass
   nullseal get -p mypass --local
   nullseal manage \"id@secret\" --replace \"new content\" -p mypass
-  nullseal manage \"id@secret\" --destroy"
+  nullseal manage \"id@secret\" --destroy
+  nullseal check server
+  nullseal check server --verbose
+  nullseal check turn
+  nullseal check server -s https://core.staging.nullseal.com"
 )]
 struct Cli {
     /// Machine-friendly output: write only the result to stdout, no logs, exit code only
@@ -146,6 +159,8 @@ enum Commands {
         replace: bool,
         #[arg(long, help = "Destroy share permanently (shorthand for -c destroy)")]
         destroy: bool,
+        #[arg(short = 'y', long = "yes", help = "Skip the destroy confirmation prompt")]
+        yes: bool,
         // -- content type (must match the original share) --
         #[arg(short = 't', long = "type", help = "Content type (alias for the booleans): txt | file | pwd")]
         content_type: Option<String>,
@@ -156,12 +171,66 @@ enum Commands {
         #[arg(long, help = "Replace with a password-type secret")]
         pwd: bool,
     },
+    #[command(about = "Diagnose backend connectivity (server reachable? can create a session? STUN/TURN?)")]
+    Check {
+        #[command(subcommand)]
+        target: CheckTarget,
+    },
+}
+
+#[derive(Subcommand)]
+enum CheckTarget {
+    #[command(about = "Full diagnostic: config, DNS, TCP/TLS, web, core API, create-session, signaling, STUN, TURN")]
+    Server {
+        #[arg(short = 's', long = "server", help = "Override the core API base URL (default: CLI_APPS_CORE_URL)")]
+        server: Option<String>,
+    },
+    #[command(about = "STUN/TURN reachability subset: DNS + STUN Binding + TURN Allocate (is UDP/relay blocked?)")]
+    Turn {
+        #[arg(short = 's', long = "server", help = "Override the core API base URL (default: CLI_APPS_CORE_URL)")]
+        server: Option<String>,
+    },
 }
 
 fn prompt_password() -> String {
     eprint!("\x1b[1;33m🔑 Password:\x1b[0m ");
     io::stderr().flush().ok();
     rpassword::read_password().unwrap_or_default()
+}
+
+/// Outcome of the destroy confirmation gate.
+enum DestroyConfirm {
+    /// User typed yes/y at the interactive prompt.
+    Confirmed,
+    /// User typed anything else at the interactive prompt → print "Aborted.".
+    Declined,
+    /// stdin is not a TTY and --yes was not passed → refuse without hanging.
+    NoTty,
+}
+
+/// Interactive confirmation gate for `manage … --destroy`.
+///
+/// Prints the warning + prompt to stderr (stdout stays machine-clean) and reads
+/// a line from stdin. Returns `Confirmed` only when the user types `yes`/`y`
+/// (case-insensitive, trimmed). If stdin is not a TTY we return `NoTty` rather
+/// than hang on a read that would never receive input from a human.
+fn confirm_destroy() -> DestroyConfirm {
+    use std::io::IsTerminal;
+    if !io::stdin().is_terminal() {
+        eprintln!("Refusing to destroy without confirmation. Re-run with --yes.");
+        return DestroyConfirm::NoTty;
+    }
+    eprint!("This permanently destroys the share and cannot be undone. Type 'yes' to confirm: ");
+    io::stderr().flush().ok();
+    let mut line = String::new();
+    if io::stdin().read_line(&mut line).is_err() {
+        return DestroyConfirm::Declined;
+    }
+    if matches!(line.trim().to_ascii_lowercase().as_str(), "yes" | "y") {
+        DestroyConfirm::Confirmed
+    } else {
+        DestroyConfirm::Declined
+    }
 }
 
 fn main() {
@@ -201,6 +270,20 @@ async fn async_main() {
     };
 
     let result = match cli.command {
+        // `check` owns its own output + exit code (verdict-driven). It prints in the
+        // active mode and exits directly, so it never reaches the generic Result
+        // handling below.
+        Commands::Check { target } => {
+            let code = match target {
+                CheckTarget::Server { server } => {
+                    commands::check::run(commands::check::Target::Server, server).await
+                }
+                CheckTarget::Turn { server } => {
+                    commands::check::run(commands::check::Target::Turn, server).await
+                }
+            };
+            std::process::exit(code);
+        }
         Commands::Share { content, password, mode, content_type, file, text, pwd, p2p, upload, local, address, ttl, one_time } => {
             let content = stdin_content.unwrap_or(content);
             let password = if pipe_mode {
@@ -260,7 +343,7 @@ async fn async_main() {
                 commands::share::run(content, password, resolved_mode, resolved_content_type, None, ttl, one_time, relay_only, &mut |s| commands::log::result(s)).await
             }
         }
-        Commands::Manage { owner_code, password, content, action, replace, destroy, content_type, text, file, pwd } => {
+        Commands::Manage { owner_code, password, content, action, replace, destroy, yes, content_type, text, file, pwd } => {
             // Resolve action from -c flag or boolean shorthands
             let resolved_action = if destroy {
                 "destroy".to_string()
@@ -276,6 +359,20 @@ async fn async_main() {
             if resolved_action != "replace" && resolved_action != "destroy" {
                 commands::log::error(&format!("Unknown action: {resolved_action}. Supported: replace, destroy"));
                 std::process::exit(1);
+            }
+
+            // Destroy is irreversible: require an explicit confirmation unless --yes
+            // is given. Non-TTY without --yes refuses (see confirm_destroy) rather
+            // than blocking on a prompt that no human can answer.
+            if resolved_action == "destroy" && !yes {
+                match confirm_destroy() {
+                    DestroyConfirm::Confirmed => {}
+                    DestroyConfirm::Declined => {
+                        eprintln!("Aborted.");
+                        std::process::exit(1);
+                    }
+                    DestroyConfirm::NoTty => std::process::exit(1),
+                }
             }
 
             let password = if resolved_action == "replace" {
