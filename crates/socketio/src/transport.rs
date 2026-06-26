@@ -32,8 +32,11 @@ impl TungsteniteWs {
 
     /// Build an Engine.IO v4 WebSocket URL from an HTTP server URL.
     ///
-    /// Converts `http://` → `ws://`, `https://` → `wss://`, appends
-    /// `/socket.io/?EIO=4&transport=websocket`.
+    /// Converts `http://` → `ws://`, `https://` → `wss://`, and appends
+    /// `<base-path>/socket.io/?EIO=4&transport=websocket`. Any base path on the
+    /// server URL is preserved so the engine.io endpoint sits under the same
+    /// reverse-proxy prefix as the REST API — e.g. `https://nullseal.com/core`
+    /// → `wss://nullseal.com/core/socket.io/…`. A bare origin yields `/socket.io/`.
     pub fn build_url(server_url: &str) -> Result<String> {
         let mut url = url::Url::parse(server_url)?;
         match url.scheme() {
@@ -41,7 +44,8 @@ impl TungsteniteWs {
             "https" => url.set_scheme("wss").unwrap(),
             _ => {}
         }
-        url.set_path("/socket.io/");
+        let base = url.path().trim_end_matches('/').to_owned(); // "" or "/core"
+        url.set_path(&format!("{base}/socket.io/"));
         url.query_pairs_mut()
             .append_pair("EIO", "4")
             .append_pair("transport", "websocket");
@@ -88,5 +92,18 @@ mod tests {
         let url = TungsteniteWs::build_url("https://api.example.com").unwrap();
         assert!(url.starts_with("wss://api.example.com/socket.io/"));
         assert!(url.contains("EIO=4"));
+    }
+
+    #[test]
+    fn build_url_preserves_base_path() {
+        // Core reverse-proxied under /core: the engine.io endpoint must stay under
+        // the same prefix so it routes through the proxy, not the web app at root.
+        let url = TungsteniteWs::build_url("https://nullseal.com/core").unwrap();
+        assert!(url.starts_with("wss://nullseal.com/core/socket.io/"), "got {url}");
+        assert!(url.contains("EIO=4"));
+        assert!(url.contains("transport=websocket"));
+        // Trailing slash on the base must not double up.
+        let url2 = TungsteniteWs::build_url("https://nullseal.com/core/").unwrap();
+        assert!(url2.starts_with("wss://nullseal.com/core/socket.io/"), "got {url2}");
     }
 }
