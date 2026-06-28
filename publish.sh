@@ -49,7 +49,7 @@ cd npm/nullseal
 VERSION=$(npm version "$BUMP" --no-git-tag-version | tr -d 'v')
 cd "$SCRIPT_DIR"
 
-for pkg in linux-x64 linux-arm64 darwin-arm64; do
+for pkg in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
   cd "npm/$pkg"
   npm version "$VERSION" --no-git-tag-version --allow-same-version
   cd "$SCRIPT_DIR"
@@ -98,11 +98,21 @@ done
 
 # ── Build macOS arm64 (native) ────────────────────────────────────────────────
 echo "🔨 Building macOS arm64 (native)..."
+rustup target add aarch64-apple-darwin >/dev/null 2>&1 || true
 cargo build --release --target aarch64-apple-darwin
 mkdir -p npm/darwin-arm64/bin
 cp target/aarch64-apple-darwin/release/nullseal npm/darwin-arm64/bin/nullseal
 chmod +x npm/darwin-arm64/bin/nullseal
 echo "  ✅ darwin-arm64"
+
+# ── Build macOS x64 / Intel (cross-compile; Apple SDK is universal) ───────────
+echo "🔨 Building macOS x64 (Intel)..."
+rustup target add x86_64-apple-darwin >/dev/null 2>&1 || true
+cargo build --release --target x86_64-apple-darwin
+mkdir -p npm/darwin-x64/bin
+cp target/x86_64-apple-darwin/release/nullseal npm/darwin-x64/bin/nullseal
+chmod +x npm/darwin-x64/bin/nullseal
+echo "  ✅ darwin-x64"
 
 echo "✅ All platforms built"
 
@@ -114,7 +124,7 @@ echo ""
 # Write .npmrc with token (no npm login needed)
 echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "$SCRIPT_DIR/.npmrc"
 
-for pkg in linux-x64 linux-arm64 darwin-arm64; do
+for pkg in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
   echo "  Publishing @nullseal/$pkg..."
   cd "npm/$pkg"
   npm publish --access public --userconfig "$SCRIPT_DIR/.npmrc"

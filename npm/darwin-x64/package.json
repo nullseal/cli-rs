@@ -1,8 +1,12 @@
 {
   "name": "@nullseal/darwin-x64",
-  "version": "0.3.0",
+  "version": "0.16.1",
   "description": "NullSeal CLI binary for macOS x64 (Intel)",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nullseal/cli-rs"
+  },
   "os": [
     "darwin"
   ],
