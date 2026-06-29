@@ -22,6 +22,20 @@ pub(crate) fn with_conn_hint(e: crate::api::ApiError) -> anyhow::Error {
 }
 
 pub const SUPPORTED_EXTENSIONS: &[&str] = &[
+    // config / dotfiles — env files (.env, .env.local, .env.production …) are
+    // normalised to ".env" by file_extension(), so this one entry covers them all.
+    // Files with NO extension (Dockerfile, Makefile, .gitignore, …) are also
+    // accepted — the upload check skips the list when the extension is empty.
+    ".env",
+    // source code (.ts is already listed under video / MPEG-TS below)
+    ".js", ".mjs", ".cjs", ".tsx", ".jsx", ".py", ".rb", ".go", ".rs",
+    ".java", ".kt", ".c", ".h", ".cpp", ".hpp", ".cc", ".cs", ".php", ".swift",
+    ".scala", ".lua", ".pl", ".r", ".dart", ".sql", ".graphql", ".proto",
+    ".css", ".scss", ".sass", ".less", ".vue", ".svelte", ".astro", ".html", ".htm",
+    // dev config / build
+    ".lock", ".gradle", ".properties", ".cmake", ".ipynb", ".patch", ".diff",
+    // certificates / keys (text-encoded)
+    ".pem", ".crt", ".cer", ".csr", ".pub",
     // text & data
     ".txt", ".md", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml",
     ".toml", ".ini", ".cfg", ".conf", ".log", ".rtf", ".tex", ".srt",

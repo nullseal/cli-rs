@@ -3,5 +3,9 @@ test-results
 target
 npm/*/bin/
 .DS_Store
-.env.*local
+
+# Env files — ignore every variant (secrets, incl. .env.release), keep safe templates
 .env
+.env.*
+!.env.example
+!.env.*.example

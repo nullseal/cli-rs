@@ -20,6 +20,15 @@ fn server_url(server: Option<&str>) -> Result<String> {
 }
 
 fn file_extension(filename: &str) -> String {
+    // Env files (.env, .env.local, .env.production …) normalise to ".env" so a
+    // single allow-list entry covers the family (mirrors share.rs + the web client).
+    let base = Path::new(filename)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if base == ".env" || base.starts_with(".env.") {
+        return ".env".to_string();
+    }
     Path::new(filename)
         .extension()
         .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
@@ -147,11 +156,9 @@ fn read_content(content: &str, content_type: &str) -> Result<(Vec<u8>, Option<Fi
             .to_string_lossy()
             .into_owned();
         let extension = file_extension(&filename);
-        if !SUPPORTED_EXTENSIONS.contains(&extension.as_str()) {
-            bail!(
-                "Unsupported file extension: {}",
-                if extension.is_empty() { "(none)" } else { &extension }
-            );
+        // Empty extension = an extensionless file (Dockerfile, Makefile, …) — allowed.
+        if !extension.is_empty() && !SUPPORTED_EXTENSIONS.contains(&extension.as_str()) {
+            bail!("Unsupported file extension: {extension}");
         }
         if bytes.len() as u64 > SERVER_MAX_BYTES {
             bail!("File exceeds upload limit (2 MB).");

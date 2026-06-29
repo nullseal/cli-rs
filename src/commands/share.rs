@@ -32,6 +32,16 @@ fn user_url() -> Option<String> {
 }
 
 fn file_extension(filename: &str) -> String {
+    // Env files (.env, .env.local, .env.production …) have unbounded suffixes;
+    // normalise them all to ".env" so a single allow-list entry covers the family
+    // and the server (which only sees this extension, never the filename) can validate it.
+    let base = Path::new(filename)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if base == ".env" || base.starts_with(".env.") {
+        return ".env".to_string();
+    }
     Path::new(filename)
         .extension()
         .map(|e| format!(".{}", e.to_string_lossy().to_lowercase()))
@@ -50,8 +60,10 @@ fn validate(content: &str, password: &str, mode: &str, content_type: &str) -> Re
             .unwrap_or("");
         let ext = file_extension(name);
         if mode != "p2p" {
-            if !SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
-                bail!("Unsupported file extension: {}", if ext.is_empty() { "(none)" } else { &ext });
+            // Empty extension = an extensionless file (Dockerfile, Makefile,
+            // .gitignore, …) — allowed. Otherwise it must be on the allow-list.
+            if !ext.is_empty() && !SUPPORTED_EXTENSIONS.contains(&ext.as_str()) {
+                bail!("Unsupported file extension: {ext}");
             }
             let size = std::fs::metadata(content).map(|m| m.len()).unwrap_or(0);
             if size > SERVER_MAX_BYTES {
@@ -1342,6 +1354,65 @@ mod tests {
     #[test]
     fn file_extension_hidden_file() {
         assert_eq!(file_extension(".gitignore"), "");
+    }
+
+    #[test]
+    fn file_extension_env_dotfiles_normalise_to_env() {
+        assert_eq!(file_extension(".env"), ".env");
+        assert_eq!(file_extension(".env.local"), ".env");
+        assert_eq!(file_extension(".env.production"), ".env");
+        assert_eq!(file_extension("/path/to/.env.staging"), ".env");
+        assert_eq!(file_extension(".ENV"), ".env");
+    }
+
+    #[test]
+    fn supported_extensions_includes_env() {
+        assert!(crate::commands::SUPPORTED_EXTENSIONS.contains(&".env"));
+    }
+
+    #[test]
+    fn validate_upload_allows_env_file() {
+        use std::io::Write;
+        // A literal `.env.local` file must pass the upload-mode allow-list.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(".env.local");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"SECRET=1").unwrap();
+        validate(path.to_str().unwrap(), "password", "u", "file").unwrap();
+    }
+
+    #[test]
+    fn supported_extensions_includes_developer_and_cert_types() {
+        for ext in [".js", ".ts", ".py", ".rs", ".sql", ".pem", ".crt", ".csr", ".pub", ".ipynb"] {
+            assert!(
+                crate::commands::SUPPORTED_EXTENSIONS.contains(&ext),
+                "missing {ext}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_upload_allows_source_and_extensionless_files() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["main.rs", "Dockerfile", "Makefile", ".gitignore"] {
+            let path = dir.path().join(name);
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"x").unwrap();
+            validate(path.to_str().unwrap(), "password", "u", "file")
+                .unwrap_or_else(|e| panic!("{name} should be allowed: {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_upload_still_rejects_unknown_extension() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malware.exe");
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(b"x").unwrap();
+        let err = validate(path.to_str().unwrap(), "password", "u", "file").unwrap_err();
+        assert!(err.to_string().to_lowercase().contains("unsupported"));
     }
 
     // ── run_inner: mode validation ───────────────────────────────────────
