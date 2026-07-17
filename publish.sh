@@ -49,7 +49,7 @@ cd npm/nullseal
 VERSION=$(npm version "$BUMP" --no-git-tag-version | tr -d 'v')
 cd "$SCRIPT_DIR"
 
-for pkg in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
+for pkg in linux-x64 linux-arm64 darwin-arm64 darwin-x64 win32-x64; do
   cd "npm/$pkg"
   npm version "$VERSION" --no-git-tag-version --allow-same-version
   cd "$SCRIPT_DIR"
@@ -114,6 +114,16 @@ cp target/x86_64-apple-darwin/release/nullseal npm/darwin-x64/bin/nullseal
 chmod +x npm/darwin-x64/bin/nullseal
 echo "  ✅ darwin-x64"
 
+# ── Build Windows x64 (Docker cross-compile, mingw-w64; vendored OpenSSL) ─────
+echo "🔨 Building Windows x64 (x86_64-pc-windows-gnu) via Docker (native cross-compile)..."
+mkdir -p npm/win32-x64/bin
+docker buildx build \
+  -f Dockerfile.windows \
+  --build-arg "RUST_TARGET=x86_64-pc-windows-gnu" \
+  --output "type=local,dest=npm/win32-x64/bin" \
+  .
+echo "  ✅ win32-x64"
+
 echo "✅ All platforms built"
 
 # ── Publish to npm ───────────────────────────────────────────────────────────
@@ -124,7 +134,7 @@ echo ""
 # Write .npmrc with token (no npm login needed)
 echo "//registry.npmjs.org/:_authToken=${NPM_TOKEN}" > "$SCRIPT_DIR/.npmrc"
 
-for pkg in linux-x64 linux-arm64 darwin-arm64 darwin-x64; do
+for pkg in linux-x64 linux-arm64 darwin-arm64 darwin-x64 win32-x64; do
   echo "  Publishing @nullseal/$pkg..."
   cd "npm/$pkg"
   npm publish --access public --userconfig "$SCRIPT_DIR/.npmrc"

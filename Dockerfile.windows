@@ -1,0 +1,77 @@
+# syntax=docker/dockerfile:1
+#
+# Builds the NullSeal Rust CLI as a Windows x64 binary (nullseal.exe) by
+# CROSS-COMPILING from the host's native architecture with the mingw-w64
+# GNU toolchain — NO QEMU/Rosetta emulation of the build.
+#
+# Why: same rationale as Dockerfile.linux. Pinning the builder to
+# $BUILDPLATFORM keeps it on the native host arch, so Debian's apt / gpgv
+# never run emulated (which otherwise mis-verifies repo signatures and breaks
+# `apt-get update`). The Windows target is selected by RUST_TARGET, not
+# `--platform`.
+#
+# The `rust:<tag>` image bundles the Rust toolchain; we add the mingw-w64 cross
+# C toolchain (for `ring` + vendored OpenSSL via str0m) plus perl/make (needed
+# to build vendored OpenSSL for the target).
+#
+# ── Build (driven by publish.sh) ─────────────────────────────────────────────
+#
+#   docker buildx build -f Dockerfile.windows \
+#     --build-arg RUST_TARGET=x86_64-pc-windows-gnu \
+#     --output type=local,dest=npm/win32-x64/bin .
+#
+#   Note: do NOT pass `--platform`. The target arch is selected by RUST_TARGET;
+#   the builder always runs on the native host arch ($BUILDPLATFORM).
+#
+#   First build is slow (compiles all deps incl. vendored OpenSSL). Subsequent
+#   builds reuse the cargo registry/target cache mounts.
+
+# Pin the builder to the BUILD platform (native) — this is what avoids emulation.
+# rust:1-bookworm tracks the latest stable 1.x (matching how Dockerfile.linux
+# uses the untagged musl-cross image). Must be >= 1.85: a transitive dep
+# (clap_lex 1.1.0, via clap 4) requires the `edition2024` Cargo feature, which
+# is unstable on 1.84 and older.
+FROM --platform=$BUILDPLATFORM rust:1-bookworm AS builder
+
+ARG RUST_TARGET=x86_64-pc-windows-gnu
+
+WORKDIR /app
+
+# ── Cross toolchain ───────────────────────────────────────────────────────────
+# mingw-w64 provides x86_64-w64-mingw32-gcc / -ar (the Windows GNU linker + ar).
+# perl + make build the vendored OpenSSL for the Windows target.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends mingw-w64 perl make \
+    && rm -rf /var/lib/apt/lists/*
+
+# Add the Windows GNU target for the Rust toolchain.
+RUN rustup target add "${RUST_TARGET}"
+
+# Point cargo/cc/openssl-sys at the mingw cross toolchain for this target.
+ENV CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc \
+    CC_x86_64_pc_windows_gnu=x86_64-w64-mingw32-gcc \
+    AR_x86_64_pc_windows_gnu=x86_64-w64-mingw32-ar
+
+# ── Copy the full Cargo workspace ─────────────────────────────────────────────
+# This is a workspace: the root crate depends on the local member crates under
+# crates/ (socketio, p2p-control, turn), so they must all be present. .env holds
+# the compile-time vars (CLI_APPS_CORE_URL, CLI_APPS_USER_URL) that build.rs reads.
+# .dockerignore already excludes target/, npm/, .git/, .dist/, *.md.
+COPY Cargo.toml Cargo.lock build.rs .env ./
+COPY src ./src
+COPY crates ./crates
+
+# ── Build the Windows binary ──────────────────────────────────────────────────
+# The cargo registry + target cache mounts persist compiled dependencies (incl.
+# the vendored OpenSSL build) across builds, so rebuilds are incremental even
+# without a separate stub-deps layer. `--config profile.release.strip=true`
+# strips symbols at link time, so no target-specific `strip` binary is needed.
+RUN --mount=type=cache,target=/root/.cargo/registry,id=cargo-registry-${RUST_TARGET} \
+    --mount=type=cache,target=/app/target,id=cargo-target-${RUST_TARGET} \
+    cargo build --release --target "${RUST_TARGET}" --config profile.release.strip=true \
+    && cp "target/${RUST_TARGET}/release/nullseal.exe" /nullseal.exe
+
+# ── Export — nothing but the binary ──────────────────────────────────────────
+# 'docker buildx build --output type=local,dest=<dir> .' copies /nullseal.exe out.
+FROM scratch
+COPY --from=builder /nullseal.exe /nullseal.exe
