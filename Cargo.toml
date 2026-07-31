@@ -78,7 +78,10 @@ nullseal-socketio = { path = "crates/socketio" }
 nullseal-turn = { path = "crates/turn" }
 
 [dev-dependencies]
-tokio       = { version = "1", features = ["full"] }
+# `test-util` (dev-only — it does not reach the shipped binary) gives tests a
+# paused clock, so timeout paths like `await_answer` are covered without the
+# suite actually sleeping for the timeout.
+tokio       = { version = "1", features = ["full", "test-util"] }
 wiremock    = "0.6"
 hex-literal = "0.4"
 tempfile    = "3"

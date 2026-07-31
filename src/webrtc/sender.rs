@@ -4,7 +4,8 @@ use tokio::sync::mpsc;
 
 use crate::api::IceServer as ApiIceServer;
 
-use super::event_loop;
+use super::event_loop::{self, IceDebug};
+use super::ice_log;
 use super::net::bind_udp;
 use super::{build_rtc, setup_turn, LoopCmd, LoopEvent};
 
@@ -43,14 +44,19 @@ impl SenderPeer {
         relay_only: bool,
     ) -> Result<Self> {
         let (socket, local_addr) = bind_udp(bind_ip).await?;
-        let mut rtc = if relay_only {
+        let (mut rtc, mut gathered) = if relay_only {
             super::build_rtc_relay_only(local_addr)?
         } else {
             build_rtc(local_addr)?
         };
 
         // Attempt TURN allocation (no-op if no TURN server configured)
-        let turn_relay = setup_turn(&socket, local_addr, &ice_servers, &mut rtc).await;
+        let turn_relay =
+            setup_turn(&socket, local_addr, &ice_servers, &mut rtc, &mut gathered).await;
+
+        // Gathering is finished here — the CLI does not trickle, so whatever is
+        // in `gathered` now is everything the peer will ever hear about.
+        ice_log::log_gathered(&gathered);
 
         let mut api = rtc.sdp_api();
         let channel_id = api.add_channel("nullseal-transfer".to_string());
@@ -58,6 +64,9 @@ impl SenderPeer {
             .apply()
             .ok_or_else(|| anyhow::anyhow!("no SDP changes to apply"))?;
         let offer_sdp = offer.to_sdp_string();
+
+        // What actually rides out to the peer inside the offer.
+        ice_log::log_sent_in_sdp(&offer_sdp, "offer");
 
         let (cmd_tx, mut cmd_rx) = mpsc::channel(CMD_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::unbounded_channel();
@@ -72,6 +81,9 @@ impl SenderPeer {
                 Some(pending),
                 Some(channel_id),
                 turn_relay,
+                // The sender learns the peer's candidates from the answer SDP,
+                // which arrives later via `LoopCmd::ApplyAnswer`.
+                IceDebug::new(gathered, Vec::new()),
             )
             .await;
         });

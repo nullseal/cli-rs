@@ -23,6 +23,16 @@ pub const PEER_TIMEOUT_SECS: u64 = 10;
 /// Timeout waiting for DataChannel to open (ICE + DTLS).
 pub const CHANNEL_TIMEOUT_SECS: u64 = 10;
 
+/// Timeout waiting for the recipient's SDP answer after our offer went out.
+///
+/// Deliberately more generous than `PEER_TIMEOUT_SECS`/`CHANNEL_TIMEOUT_SECS`:
+/// by this point the recipient is already known to be present (`p2p:both-ready`
+/// fired), and before it can answer it must bind a UDP socket and, online, wait
+/// out a TURN allocation. What this bounds is the pathological case — the
+/// recipient never negotiates at all — which previously hung the sender forever
+/// with no output at any verbosity.
+pub const ANSWER_TIMEOUT_SECS: u64 = 30;
+
 /// Prompt user to manually retry after auto-retries are exhausted.
 /// Returns `true` if user wants to retry, `false` to abort.
 /// In non-interactive mode (piped stdin), returns `false`.
