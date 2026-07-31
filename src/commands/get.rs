@@ -756,7 +756,7 @@ pub async fn run_local(
     // 1. Resolve sender address (via mDNS or explicit)
     let addr = match ip {
         Some(a) => {
-            super::log::step(&format!("📡 Connecting to {a}…"));
+            super::log::step(&format!("› Connecting to {a}…"));
             a
         }
         None => crate::local::discover_addr(std::time::Duration::from_secs(30))?,

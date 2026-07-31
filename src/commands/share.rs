@@ -446,7 +446,9 @@ pub async fn run_local_with_excludes(
             .ok_or_else(|| anyhow::anyhow!("socket closed before joined"))?;
         j.get("lastChunkOffset").and_then(|v| v.as_u64()).unwrap_or(0)
     };
-    super::log::step("📡 Waiting for recipient…");
+    // No "waiting" step here: the share box printed above already ends with
+    // "› Waiting for recipient…" — repeating it verbatim two lines later was
+    // noise. (task 065; the glyph became `›` in task 066)
 
     let bind_ip: Option<std::net::IpAddr> = local_ip.parse().ok();
     let chunk_size = crate::crypto::STREAM_CHUNK_SIZE;
@@ -1018,7 +1020,8 @@ async fn run_sync_local(
         .recv()
         .await
         .ok_or_else(|| anyhow::anyhow!("socket closed before joined"))?;
-    super::log::step("📡 Waiting for recipient…");
+    // See run_local_with_excludes: the share box above already ends with
+    // "› Waiting for recipient…"; no duplicate step line here. (task 065)
 
     if !super::p2p_stages::await_ready(&mut control.events, true).await? {
         bail!("The recipient did not join.");

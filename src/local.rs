@@ -21,7 +21,7 @@ pub fn broadcast(share_url: &str) -> Result<BroadcastGuard> {
     )?;
 
     mdns.register(info)?;
-    crate::commands::log::step("📡 Broadcasting on local network…");
+    crate::commands::log::step("› Broadcasting on local network…");
 
     Ok(BroadcastGuard { mdns })
 }
@@ -33,7 +33,7 @@ pub fn discover(timeout: Duration) -> Result<String> {
     let mdns = ServiceDaemon::new()?;
     let receiver = mdns.browse(SERVICE_TYPE)?;
 
-    crate::commands::log::step("📡 Searching for shares on local network…");
+    crate::commands::log::step("› Searching for shares on local network…");
 
     let deadline = std::time::Instant::now() + timeout;
 
@@ -86,7 +86,7 @@ pub fn broadcast_addr(ip: &str, port: u16) -> Result<BroadcastGuard> {
     )?;
 
     mdns.register(info)?;
-    crate::commands::log::step("📡 Broadcasting on local network…");
+    crate::commands::log::step("› Broadcasting on local network…");
 
     Ok(BroadcastGuard { mdns })
 }
@@ -96,7 +96,7 @@ pub fn discover_addr(timeout: Duration) -> Result<String> {
     let mdns = ServiceDaemon::new()?;
     let receiver = mdns.browse(SERVICE_TYPE)?;
 
-    crate::commands::log::step("📡 Searching for shares on local network…");
+    crate::commands::log::step("› Searching for shares on local network…");
 
     let deadline = std::time::Instant::now() + timeout;
 

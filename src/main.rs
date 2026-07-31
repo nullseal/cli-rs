@@ -232,7 +232,7 @@ enum CheckTarget {
 }
 
 fn prompt_password() -> String {
-    eprint!("\x1b[1;33m🔑 Password:\x1b[0m ");
+    eprint!("\x1b[1;33m› Password:\x1b[0m ");
     io::stderr().flush().ok();
     rpassword::read_password().unwrap_or_default()
 }

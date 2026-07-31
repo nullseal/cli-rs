@@ -129,6 +129,10 @@ fn format_attempt(n: u32, max: u32, reason: &str, verbose: bool) -> String {
 /// The technical `reason` (e.g. "transfer interrupted: DataChannel closed…") is
 /// only shown in **Verbose** — Normal stays a clean
 /// `Connection interrupted, retrying (n/max)`.
+///
+/// Marked with `↻`, the same glyph as "Resuming from chunk N" — retry and resume
+/// are two halves of one interrupted run, and `⟳`/`↻` were visually
+/// indistinguishable at terminal size anyway. (task 066)
 pub fn attempt(n: u32, max: u32, reason: &str) {
     if is_pipe() {
         return;
@@ -136,7 +140,7 @@ pub fn attempt(n: u32, max: u32, reason: &str) {
     finish_progress();
     let line = format_attempt(n, max, reason, is_verbose());
     if stderr_is_tty() {
-        eprintln!("\x1b[1;33m⟳\x1b[0m {line}");
+        eprintln!("\x1b[1;33m↻\x1b[0m {line}");
     } else {
         eprintln!("{line}");
     }
