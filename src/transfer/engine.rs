@@ -6,6 +6,7 @@
 //! those bytes happens in `commands::sync_flow`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
@@ -75,6 +76,37 @@ pub fn validate_rel_path(path: &str) -> Result<(), TransferError> {
     Ok(())
 }
 
+/// Validate one **single path component** — the shared folder's name (task 064).
+///
+/// Stricter than [`validate_rel_path`] on exactly one point: a component may not
+/// contain a separator. Everything else (`..`, `.`, empty, nul, backslash,
+/// absolute, Windows drive prefix) is rejected by the shared rules, so the two
+/// stay in lockstep by construction.
+///
+/// The name arrives **from the peer** and decides where files land, so a
+/// violation must abort the sync rather than be sanitised away.
+pub fn validate_path_component(name: &str) -> Result<(), TransferError> {
+    validate_rel_path(name)?;
+    if name.contains('/') {
+        return Err(TransferError::UnsafePath {
+            path: name.to_string(),
+            reason: "path separator".to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// The receiver's sync root: `<output_dir>/<folder>`.
+///
+/// Pure — it only validates and joins; creating the directory (and refusing a
+/// non-directory already sitting there) is the caller's I/O job. Because
+/// `folder` is a validated single component, the result is always exactly one
+/// level below `output_dir`: no traversal, no absolute redirect.
+pub fn sync_root(output_dir: &Path, folder: &str) -> Result<PathBuf, TransferError> {
+    validate_path_component(folder)?;
+    Ok(output_dir.join(folder))
+}
+
 /// Shared hello check: the version must match exactly and the declared mode must
 /// be the one this side is running. Used by sender and receiver alike.
 pub fn check_hello(
@@ -91,9 +123,10 @@ pub fn check_hello(
     Ok(())
 }
 
-/// Our own hello frame.
-pub fn hello_frame(mode: TransferMode) -> ControlFrame {
-    ControlFrame::Hello { proto_version: PROTO_VERSION, mode }
+/// Our own hello frame. `folder` is the shared directory's base name on the
+/// sender side and `None` on the receiver side (it has nothing to announce).
+pub fn hello_frame(mode: TransferMode, folder: Option<String>) -> ControlFrame {
+    ControlFrame::Hello { proto_version: PROTO_VERSION, mode, folder }
 }
 
 /// What the sender does after a `FileFail`: one retry per file, then abort.
@@ -241,11 +274,6 @@ impl ReceiverEngine {
         }
     }
 
-    /// Version + mode negotiation from the sender's hello.
-    pub fn on_hello(&self, proto_version: u16, mode: TransferMode) -> Result<(), TransferError> {
-        check_hello(proto_version, mode, TransferMode::Sync)
-    }
-
     /// Accumulate one manifest batch, validating every path up front.
     pub fn on_manifest(&mut self, files: &[FileEntry], more: bool) -> Result<(), TransferError> {
         for f in files {
@@ -389,14 +417,78 @@ mod tests {
         }
     }
 
+    // ── folder name / sync root (task 064) ───────────────────────────────
+
+    #[test]
+    fn a_plain_folder_name_is_accepted_as_a_component() {
+        for name in ["abc", "proj", "tài-liệu", ".hidden", "a..b", "with space"] {
+            validate_path_component(name)
+                .unwrap_or_else(|e| panic!("{name} should be a safe component: {e}"));
+        }
+    }
+
+    #[test]
+    fn every_escaping_folder_name_is_rejected() {
+        // A component is stricter than a relative path: a separator is illegal
+        // here even though "sub/b.txt" is a perfectly good relative path.
+        let cases = [
+            ("sub/b.txt", "path separator"),
+            ("a/b", "path separator"),
+            ("../../.ssh", "\"..\" traversal"),
+            ("..", "\"..\" traversal"),
+            (".", "\".\" component"),
+            ("", "empty path"),
+            ("/etc", "absolute path"),
+            ("/", "absolute path"),
+            ("evil\\x", "backslash"),
+            ("C:\\Windows", "backslash"),
+            ("C:Windows", "windows drive prefix"),
+            ("a\0b", "nul byte"),
+        ];
+        for (name, reason) in cases {
+            match validate_path_component(name) {
+                Err(TransferError::UnsafePath { path, reason: r }) => {
+                    assert_eq!(path, name);
+                    assert_eq!(r, reason, "wrong reason for {name:?}");
+                }
+                other => panic!("{name:?} must be rejected, got {other:?}"),
+            }
+            assert!(
+                sync_root(Path::new("/out"), name).is_err(),
+                "{name:?} must never resolve to a sync root"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sync_root_is_always_exactly_one_level_under_the_output_dir() {
+        assert_eq!(sync_root(Path::new("/out"), "abc").unwrap(), PathBuf::from("/out/abc"));
+        assert_eq!(sync_root(Path::new("."), "abc").unwrap(), PathBuf::from("./abc"));
+        let root = sync_root(Path::new("/out"), "abc").unwrap();
+        assert_eq!(root.parent(), Some(Path::new("/out")), "the root may not escape -o");
+    }
+
     // ── hello / version negotiation ──────────────────────────────────────
 
     #[test]
     fn hello_matches_on_same_version_and_mode() {
         check_hello(PROTO_VERSION, TransferMode::Sync, TransferMode::Sync).unwrap();
         assert_eq!(
-            hello_frame(TransferMode::Sync),
-            ControlFrame::Hello { proto_version: PROTO_VERSION, mode: TransferMode::Sync }
+            hello_frame(TransferMode::Sync, Some("proj".into())),
+            ControlFrame::Hello {
+                proto_version: PROTO_VERSION,
+                mode: TransferMode::Sync,
+                folder: Some("proj".into()),
+            }
+        );
+        // The receiver announces no folder of its own.
+        assert_eq!(
+            hello_frame(TransferMode::Sync, None),
+            ControlFrame::Hello {
+                proto_version: PROTO_VERSION,
+                mode: TransferMode::Sync,
+                folder: None,
+            }
         );
     }
 
@@ -423,9 +515,6 @@ mod tests {
                 actual: TransferMode::File,
             }
         );
-        let engine = ReceiverEngine::new(vec![], false, false);
-        assert!(engine.on_hello(PROTO_VERSION, TransferMode::File).is_err());
-        engine.on_hello(PROTO_VERSION, TransferMode::Sync).unwrap();
     }
 
     // ── the diff matrix ──────────────────────────────────────────────────

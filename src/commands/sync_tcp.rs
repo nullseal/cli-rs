@@ -596,6 +596,7 @@ mod tests {
         a.send(&Frame::Control(ControlFrame::Hello {
             proto_version: 1,
             mode: TransferMode::Sync,
+            folder: Some("proj".into()),
         }))
         .await
         .unwrap();
@@ -658,6 +659,7 @@ mod tests {
         a.send(&Frame::Control(ControlFrame::Hello {
             proto_version: 1,
             mode: TransferMode::Sync,
+            folder: Some("proj".into()),
         }))
         .await
         .unwrap();

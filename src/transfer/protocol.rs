@@ -90,7 +90,21 @@ pub struct PathHash {
 #[serde(tag = "t", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ControlFrame {
     /// Version + mode negotiation, sent first by **both** sides.
-    Hello { proto_version: u16, mode: TransferMode },
+    ///
+    /// `folder` is the **base name of the shared directory**, sent by the sender
+    /// only (the receiver answers with `None`). It is the first thing on the
+    /// wire because the receiver needs it before it touches the disk: the
+    /// receiver's sync root is `<output_dir>/<folder>`, and nothing outside that
+    /// root is ever read, written or deleted (task 064). The name is
+    /// peer-controlled, so the receiver validates it as a single safe path
+    /// component ([`crate::transfer::engine::validate_path_component`]) and
+    /// aborts on violation.
+    Hello {
+        proto_version: u16,
+        mode: TransferMode,
+        #[serde(default)]
+        folder: Option<String>,
+    },
     /// A batch of the sender's file list; `more = true` means another batch
     /// follows. Sent even when nothing will transfer — `--replace-delete` cannot
     /// compute the prune set without the full source set.
@@ -141,6 +155,11 @@ pub enum TransferError {
     ModeMismatch { expected: TransferMode, actual: TransferMode },
     #[error("unsafe path \"{path}\" ({reason}) — transfer aborted, nothing was applied")]
     UnsafePath { path: String, reason: String },
+    #[error(
+        "the sender's hello did not name the shared folder — nothing was written. \
+         Update nullseal on the sending machine."
+    )]
+    MissingFolder,
     #[error("hash mismatch for \"{path}\"")]
     HashMismatch { path: String },
     #[error("unexpected frame: {0}")]
@@ -239,10 +258,12 @@ mod tests {
         round_trip(Frame::Control(ControlFrame::Hello {
             proto_version: PROTO_VERSION,
             mode: TransferMode::Sync,
+            folder: Some("proj".into()),
         }));
         round_trip(Frame::Control(ControlFrame::Hello {
             proto_version: 7,
             mode: TransferMode::File,
+            folder: None,
         }));
         round_trip(Frame::Control(ControlFrame::Manifest {
             files: vec![entry("a.txt"), entry("sub/b.txt")],
@@ -292,6 +313,7 @@ mod tests {
         let hello = encode_frame(&Frame::Control(ControlFrame::Hello {
             proto_version: 1,
             mode: TransferMode::Sync,
+            folder: Some("proj".into()),
         }))
         .unwrap();
         assert_eq!(hello[0], TAG_CONTROL);
@@ -299,6 +321,26 @@ mod tests {
         assert!(json.contains("\"t\":\"hello\""), "internally tagged JSON: {json}");
         assert!(json.contains("\"mode\":\"sync\""), "{json}");
         assert!(json.contains("\"protoVersion\":1"), "{json}");
+        assert!(json.contains("\"folder\":\"proj\""), "{json}");
+    }
+
+    #[test]
+    fn a_hello_without_a_folder_decodes_as_none() {
+        // The receiver's own hello carries no folder, and a peer that omits the
+        // field entirely must decode rather than blow up — the *receiver* is what
+        // refuses a folder-less sync hello, with a typed error.
+        let mut bytes = vec![TAG_CONTROL];
+        let payload = br#"{"t":"hello","protoVersion":1,"mode":"sync"}"#;
+        bytes.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        bytes.extend_from_slice(payload);
+        assert_eq!(
+            decode_message(&bytes).unwrap(),
+            Frame::Control(ControlFrame::Hello {
+                proto_version: 1,
+                mode: TransferMode::Sync,
+                folder: None,
+            })
+        );
     }
 
     #[test]

@@ -817,6 +817,10 @@ pub async fn run_local_with_excludes(
 
 /// Walk + hash the shared folder, warning about skipped symlinks (as 051).
 fn scan_shared_folder(dir: &Path, excludes: &[String]) -> Result<(Vec<crate::transfer::protocol::FileEntry>, u64)> {
+    // The receiver mirrors into `<its -o>/<this name>`, so a folder that cannot
+    // name a sync root fails here — before a session exists or a link is printed.
+    let folder = super::sync_flow::source_folder_name(dir)?;
+    super::log::event(&format!("the recipient will sync into its output dir + \"/{folder}\""));
     let spinner = super::display::Spinner::start("Scanning the folder…");
     let (files, symlinks) = super::sync_flow::scan_source(dir, excludes)?;
     drop(spinner);

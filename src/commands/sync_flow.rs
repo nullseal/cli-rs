@@ -19,7 +19,8 @@ use anyhow::{bail, Context, Result};
 
 use crate::crypto::{StreamCipher, StreamDecryptor, StreamEncryptionMetadata};
 use crate::transfer::engine::{
-    hello_frame, DeleteDecision, Hasher, KeepReason, ReceiverEngine, SenderEngine,
+    hello_frame, sync_root, validate_path_component, DeleteDecision, Hasher, KeepReason,
+    ReceiverEngine, SenderEngine,
 };
 use crate::transfer::protocol::{
     decode_message, encode_frame, ControlFrame, FileEntry, Frame, PathHash, TransferError,
@@ -229,6 +230,32 @@ fn discard_parts_in(dir: &Path, removed: &mut usize) -> Result<()> {
     Ok(())
 }
 
+// ── the shared folder's name ──────────────────────────────────────────────────
+
+/// The base name of the shared directory — the single path component the
+/// receiver turns into its sync root (`<output_dir>/<name>`, task 064).
+///
+/// The caller canonicalizes first, so `./abc/` and `/x/y/abc` both yield `abc`.
+/// A directory with no usable base name (a filesystem root) is a hard error:
+/// there is nothing to scope the receiver to, and defaulting to the bare output
+/// directory is exactly the behaviour this replaces.
+pub fn source_folder_name(dir: &Path) -> Result<String> {
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot derive a folder name from \"{}\" — share a named directory, \
+                 not a filesystem root",
+                dir.display()
+            )
+        })?
+        .to_string();
+    validate_path_component(&name)
+        .map_err(|e| anyhow::anyhow!("cannot share \"{}\": {e}", dir.display()))?;
+    Ok(name)
+}
+
 // ── sender ────────────────────────────────────────────────────────────────────
 
 /// Drive one whole send: hello → manifest → diff → the changed files → prune
@@ -245,8 +272,13 @@ pub async fn run_sender<W: Wire>(
     let source_bytes: u64 = files.iter().map(|f| f.size).sum();
     let mut engine = SenderEngine::new(files);
 
-    wire.send(&Frame::Control(hello_frame(TransferMode::Sync))).await?;
-    super::log::event(&format!("hello sent (protocol v{PROTO_VERSION}, mode sync)"));
+    // The receiver scopes its entire run to `<its -o>/<folder>`, so the name
+    // travels in the very first frame — before it touches the disk.
+    let folder = source_folder_name(source_dir)?;
+    wire.send(&Frame::Control(hello_frame(TransferMode::Sync, Some(folder.clone())))).await?;
+    super::log::event(&format!(
+        "hello sent (protocol v{PROTO_VERSION}, mode sync, folder \"{folder}\")"
+    ));
     let mut batches = 0usize;
     for batch in engine.manifest_batches() {
         wire.send(&Frame::Control(batch)).await?;
@@ -265,7 +297,9 @@ pub async fn run_sender<W: Wire>(
     let (mut got_hello, mut got_ack) = (false, false);
     while !(got_hello && got_ack) {
         match wire.recv().await? {
-            Frame::Control(ControlFrame::Hello { proto_version, mode }) => {
+            // The recipient announces no folder of its own — the name is the
+            // sender's to give.
+            Frame::Control(ControlFrame::Hello { proto_version, mode, folder: _ }) => {
                 if let Err(e) =
                     crate::transfer::engine::check_hello(proto_version, mode, TransferMode::Sync)
                 {
@@ -447,23 +481,98 @@ struct PartFile {
     received: u64,
 }
 
-/// Drive one whole receive into `dest_root`. Files are written to
-/// `.nullseal-part` temp names and atomically renamed only after their hash
-/// verifies; a populated destination is merge-overwritten silently (spec §3), and
-/// extras are only removed with `--replace-delete`.
+/// Read the sender's hello and turn it into this run's sync root.
+///
+/// This happens **before a single byte of the destination is read**, because the
+/// root is what bounds everything that follows: the scan, every write, every
+/// `.nullseal-part`, and the `--replace-delete` prune. `output_dir` itself is
+/// never the root — sharing `./abc` always lands in `<output_dir>/abc` (task
+/// 064), which is what makes escaping the output directory structurally
+/// impossible instead of merely guarded.
+async fn resolve_sync_root<W: Wire>(wire: &mut W, output_dir: &Path) -> Result<PathBuf> {
+    let folder = match wire.recv().await? {
+        Frame::Control(ControlFrame::Hello { proto_version, mode, folder }) => {
+            if let Err(e) = crate::transfer::engine::check_hello(proto_version, mode, TransferMode::Sync)
+            {
+                abort(wire, &e.to_string()).await;
+                return Err(e.into());
+            }
+            let Some(folder) = folder else {
+                let e = TransferError::MissingFolder;
+                abort(wire, &e.to_string()).await;
+                return Err(e.into());
+            };
+            super::log::event(&format!(
+                "sender hello received (protocol v{proto_version}, mode {mode}, folder \"{folder}\")"
+            ));
+            folder
+        }
+        Frame::Control(ControlFrame::Abort { reason }) => {
+            return Err(TransferError::PeerAbort(reason).into())
+        }
+        other => {
+            let e = TransferError::Unexpected(format!(
+                "{} while expecting the sender's hello",
+                frame_label(&other)
+            ));
+            abort(wire, &e.to_string()).await;
+            return Err(e.into());
+        }
+    };
+
+    // The name is attacker-controlled: it decides where files land. A separator,
+    // a `..`, an absolute path or a drive prefix aborts the run — no sanitising,
+    // no falling back to the bare output directory.
+    let root = match sync_root(output_dir, &folder) {
+        Ok(root) => root,
+        Err(e) => {
+            abort(wire, &e.to_string()).await;
+            return Err(e.into());
+        }
+    };
+
+    // Something that is not a directory already sitting at the root would be
+    // clobbered by `create_dir_all`'s failure path or, worse, redirect the whole
+    // run through a symlink. Refuse both, loudly.
+    if let Ok(meta) = fs::symlink_metadata(&root) {
+        if !meta.is_dir() {
+            let what = if meta.file_type().is_symlink() { "a symlink" } else { "a file" };
+            let msg = format!(
+                "cannot sync into \"{}\": {what} already exists there. \
+                 Move it aside or choose a different -o.",
+                root.display()
+            );
+            abort(wire, &msg).await;
+            bail!("{msg}");
+        }
+    }
+    fs::create_dir_all(&root)
+        .with_context(|| format!("cannot create the sync folder \"{}\"", root.display()))?;
+    // Resolve it now that it exists: a destructive operation must print the
+    // absolute path it is about to work on, not a relative "." .
+    Ok(fs::canonicalize(&root).unwrap_or(root))
+}
+
+/// Drive one whole receive. The sender's hello names the shared folder, so the
+/// run is scoped to `<output_dir>/<folder>` (created if absent) and touches
+/// nothing outside it; the resolved root is returned for the run summary.
+///
+/// Files are written to `.nullseal-part` temp names and atomically renamed only
+/// after their hash verifies; a populated root is merge-overwritten silently
+/// (spec §3), and extras are only removed with `--replace-delete`.
 pub async fn run_receiver<W: Wire>(
     wire: &mut W,
-    dest_root: &Path,
+    output_dir: &Path,
     opts: SyncOptions,
-) -> Result<SyncSummary> {
-    fs::create_dir_all(dest_root)
-        .with_context(|| format!("cannot create destination \"{}\"", dest_root.display()))?;
+) -> Result<(PathBuf, SyncSummary)> {
+    let dest_root = resolve_sync_root(wire, output_dir).await?;
+    let dest_root = dest_root.as_path();
     let stale = discard_stale_parts(dest_root)?;
     if stale > 0 {
         super::log::event(&format!("discarded {stale} stale .nullseal-part file(s)"));
     }
-    // Hashing the whole destination is the receiver's longest silent stretch on a
-    // big mirror — announce it before, not after.
+    // Hashing the root is the receiver's longest silent stretch on a big mirror —
+    // announce it before, not after, and name the absolute path it is bounded to.
     super::log::step(&format!("Scanning {}…", dest_root.display()));
     let local = scan_dest(dest_root)?;
     super::log::event(&format!(
@@ -472,7 +581,7 @@ pub async fn run_receiver<W: Wire>(
     ));
     let mut engine = ReceiverEngine::new(local, opts.replace_delete, opts.confirm_all);
 
-    wire.send(&Frame::Control(hello_frame(TransferMode::Sync))).await?;
+    wire.send(&Frame::Control(hello_frame(TransferMode::Sync, None))).await?;
     super::log::event(&format!("hello sent (protocol v{PROTO_VERSION}, mode sync)"));
     super::log::step("Comparing with the sender…");
 
@@ -484,15 +593,6 @@ pub async fn run_receiver<W: Wire>(
     let result: Result<()> = async {
         loop {
             match wire.recv().await? {
-                Frame::Control(ControlFrame::Hello { proto_version, mode }) => {
-                    if let Err(e) = engine.on_hello(proto_version, mode) {
-                        abort(wire, &e.to_string()).await;
-                        return Err(e.into());
-                    }
-                    super::log::event(&format!(
-                        "sender hello received (protocol v{proto_version}, mode {mode})"
-                    ));
-                }
                 Frame::Control(ControlFrame::Manifest { files, more }) => {
                     if let Err(e) = engine.on_manifest(&files, more) {
                         abort(wire, &e.to_string()).await;
@@ -655,7 +755,7 @@ pub async fn run_receiver<W: Wire>(
         let _ = fs::remove_file(&part.part);
     }
     result?;
-    Ok(summary)
+    Ok((dest_root.to_path_buf(), summary))
 }
 
 /// Verify a finished part file and atomically move it into place.
@@ -916,9 +1016,12 @@ mod tests {
 
     /// Run a whole sender+receiver session concurrently over a loopback pair.
     /// Returns both summaries plus the byte/frame counters the sender produced.
+    ///
+    /// `out` is the receiver's **output dir**, not its sync root: the run lands in
+    /// `out/<source base name>`, which is what [`sync_root_is`] resolves.
     async fn sync_once(
         source: &Path,
-        dest: &Path,
+        out: &Path,
         opts: SyncOptions,
     ) -> Result<(SyncSummary, SyncSummary, u64, u64)> {
         let (mut a, mut b) = loopback_pair();
@@ -926,11 +1029,16 @@ mod tests {
         let frames = a.chunk_frames.clone();
         let (files, _) = scan_source(source, &[])?;
         let src = source.to_path_buf();
-        let dst = dest.to_path_buf();
+        let dst = out.to_path_buf();
         let send = async move { run_sender(&mut a, &src, files, 16 * 1024).await };
         let recv = async move { run_receiver(&mut b, &dst, opts).await };
         let (s, r) = tokio::join!(send, recv);
-        Ok((s?, r?, bytes.load(Ordering::Relaxed), frames.load(Ordering::Relaxed)))
+        Ok((s?, r?.1, bytes.load(Ordering::Relaxed), frames.load(Ordering::Relaxed)))
+    }
+
+    /// Where a sync of `source` into output dir `out` actually lands.
+    fn sync_root_is(out: &Path, source: &Path) -> PathBuf {
+        out.join(source.file_name().unwrap())
     }
 
     fn write(path: &Path, body: &[u8]) {
@@ -947,34 +1055,91 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn first_run_materialises_the_whole_tree() {
+    async fn first_run_materialises_the_whole_tree_inside_the_named_root() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
-        let dst = tmp.path().join("dst");
+        let out = tmp.path().join("out");
         fixture(&src);
 
-        let (s, r, bytes, _) = sync_once(&src, &dst, SyncOptions::default()).await.unwrap();
+        let (s, r, bytes, _) = sync_once(&src, &out, SyncOptions::default()).await.unwrap();
+        let root = sync_root_is(&out, &src);
         assert_eq!(s.files_sent, 3);
         assert_eq!(r.files_sent, 3);
         assert_eq!(s.skipped, 0);
         assert_eq!(bytes, 5 + 4 + 40_000);
-        assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"alpha");
-        assert_eq!(fs::read(dst.join("sub/b.txt")).unwrap(), b"beta");
-        assert_eq!(fs::read(dst.join("sub/deep/c.bin")).unwrap(), vec![7u8; 40_000]);
+        // Everything lands under `<out>/src`, never directly in `<out>`.
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(fs::read(root.join("sub/b.txt")).unwrap(), b"beta");
+        assert_eq!(fs::read(root.join("sub/deep/c.bin")).unwrap(), vec![7u8; 40_000]);
+        assert!(!out.join("a.txt").exists(), "-o itself must stay untouched");
+        assert_eq!(
+            fs::read_dir(&out).unwrap().count(),
+            1,
+            "the run may create exactly one entry in -o: the sync root"
+        );
         // No temp files survive a clean run.
-        assert!(scan_dest(&dst).unwrap().iter().all(|p| !p.path.ends_with(PART_SUFFIX)));
+        assert!(scan_dest(&root).unwrap().iter().all(|p| !p.path.ends_with(PART_SUFFIX)));
+    }
+
+    #[tokio::test]
+    async fn the_sync_root_is_created_when_it_does_not_exist() {
+        // The owner's case: `get` with no `-o`, into a directory that has never
+        // seen this folder. The root must be created, and only the root.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("abc");
+        let out = tmp.path().join("cwd");
+        fixture(&src);
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("unrelated.txt"), b"mine").unwrap();
+
+        let (_, r, _, _) = sync_once(&src, &out, SyncOptions::default()).await.unwrap();
+        assert_eq!(r.files_sent, 3);
+        assert!(out.join("abc").is_dir(), "the sync root must be created when absent");
+        assert_eq!(fs::read(out.join("abc/a.txt")).unwrap(), b"alpha");
+        assert_eq!(
+            fs::read(out.join("unrelated.txt")).unwrap(),
+            b"mine",
+            "a file beside the root is not part of the sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_sitting_at_the_root_path_errors_instead_of_being_clobbered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("abc");
+        let out = tmp.path().join("out");
+        fixture(&src);
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("abc"), b"i am a file, not a folder").unwrap();
+
+        let (mut a, mut b) = loopback_pair();
+        let (files, _) = scan_source(&src, &[]).unwrap();
+        let src2 = src.clone();
+        let out2 = out.clone();
+        let send = async move { run_sender(&mut a, &src2, files, 16 * 1024).await };
+        let recv = async move { run_receiver(&mut b, &out2, SyncOptions::default()).await };
+        let (_, r) = tokio::join!(send, recv);
+
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("a file already exists there"), "{err}");
+        assert_eq!(
+            fs::read(out.join("abc")).unwrap(),
+            b"i am a file, not a folder",
+            "the existing file must survive untouched"
+        );
     }
 
     #[tokio::test]
     async fn re_run_over_an_unchanged_tree_transfers_zero_bytes() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
-        let dst = tmp.path().join("dst");
+        let out = tmp.path().join("out");
+        let dst = sync_root_is(&out, &src);
         fixture(&src);
-        sync_once(&src, &dst, SyncOptions::default()).await.unwrap();
+        sync_once(&src, &out, SyncOptions::default()).await.unwrap();
 
         // Second run: same tree on both sides.
-        let (s, r, bytes, frames) = sync_once(&src, &dst, SyncOptions::default()).await.unwrap();
+        let (s, r, bytes, frames) = sync_once(&src, &out, SyncOptions::default()).await.unwrap();
         assert_eq!(frames, 0, "no chunk frame may be sent for an unchanged tree");
         assert_eq!(bytes, 0, "no file bytes may cross the wire on a steady-state re-run");
         assert_eq!(s.files_sent, 0);
@@ -990,13 +1155,14 @@ mod tests {
     async fn only_changed_and_new_files_travel_on_a_re_run() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
-        let dst = tmp.path().join("dst");
+        let out = tmp.path().join("out");
+        let dst = sync_root_is(&out, &src);
         fixture(&src);
-        sync_once(&src, &dst, SyncOptions::default()).await.unwrap();
+        sync_once(&src, &out, SyncOptions::default()).await.unwrap();
 
         write(&src.join("sub/b.txt"), b"beta-changed");
         write(&src.join("new.txt"), b"n");
-        let (s, r, bytes, _) = sync_once(&src, &dst, SyncOptions::default()).await.unwrap();
+        let (s, r, bytes, _) = sync_once(&src, &out, SyncOptions::default()).await.unwrap();
         assert_eq!(s.files_sent, 2, "only the changed + new file");
         assert_eq!(s.skipped, 2);
         assert_eq!(bytes, "beta-changed".len() as u64 + 1);
@@ -1009,12 +1175,13 @@ mod tests {
     async fn a_populated_destination_is_merge_overwritten_silently() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
-        let dst = tmp.path().join("dst");
+        let out = tmp.path().join("out");
+        let dst = sync_root_is(&out, &src);
         fixture(&src);
         write(&dst.join("a.txt"), b"mine-old");
         write(&dst.join("unrelated.txt"), b"keep me");
 
-        let (_, r, _, _) = sync_once(&src, &dst, SyncOptions::default()).await.unwrap();
+        let (_, r, _, _) = sync_once(&src, &out, SyncOptions::default()).await.unwrap();
         assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"alpha", "collision overwritten");
         assert_eq!(
             fs::read(dst.join("unrelated.txt")).unwrap(),
@@ -1029,13 +1196,14 @@ mod tests {
     async fn replace_delete_prunes_destination_extras() {
         let tmp = tempfile::tempdir().unwrap();
         let src = tmp.path().join("src");
-        let dst = tmp.path().join("dst");
+        let out = tmp.path().join("out");
+        let dst = sync_root_is(&out, &src);
         fixture(&src);
         write(&dst.join("stale.txt"), b"gone soon");
         write(&dst.join("old/deep.txt"), b"gone too");
 
         let opts = SyncOptions { replace_delete: true, confirm_all: false };
-        let (s, r, _, _) = sync_once(&src, &dst, opts).await.unwrap();
+        let (s, r, _, _) = sync_once(&src, &out, opts).await.unwrap();
         assert_eq!(r.deleted, 2);
         assert_eq!(s.deleted, 2, "the sender's summary reflects the receiver's deletions");
         assert!(!dst.join("stale.txt").exists());
@@ -1044,22 +1212,128 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fat_finger_guard_keeps_files_when_the_source_is_empty() {
+    async fn replace_delete_cannot_reach_anything_outside_the_sync_root() {
+        // The catastrophic case the scoping exists to make impossible: run
+        // `--replace-delete` with the output dir full of unrelated files and
+        // prove the prune is confined to `<out>/<folder>`.
         let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("empty-src");
-        let dst = tmp.path().join("dst");
+        let src = tmp.path().join("src");
+        let out = tmp.path().join("out");
+        let dst = sync_root_is(&out, &src);
+        fixture(&src);
+        // Sentinels *beside* the root — a file, and a whole sibling tree.
+        write(&out.join("precious.txt"), b"do not delete");
+        write(&out.join("photos/holiday.jpg"), b"jpeg");
+        // …and a real stale extra *inside* the root, which must go.
+        write(&dst.join("stale.txt"), b"gone soon");
+
+        let opts = SyncOptions { replace_delete: true, confirm_all: true };
+        let (_, r, _, _) = sync_once(&src, &out, opts).await.unwrap();
+        assert_eq!(r.deleted, 1, "only the extra inside the root may be pruned");
+        assert!(!dst.join("stale.txt").exists());
+        assert_eq!(fs::read(out.join("precious.txt")).unwrap(), b"do not delete");
+        assert_eq!(fs::read(out.join("photos/holiday.jpg")).unwrap(), b"jpeg");
+    }
+
+    #[tokio::test]
+    async fn an_escaping_folder_name_aborts_before_anything_is_written() {
+        // A hostile sender picks the name, so it is validated as a single path
+        // component. None of these may create, write or delete anything.
+        for hostile in ["../escape", "../../.ssh", "/etc", "sub/dir", "..", ".", "", "C:\\Windows"]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let out = tmp.path().join("out");
+            fs::create_dir_all(&out).unwrap();
+            write(&out.join("precious.txt"), b"mine");
+            write(&tmp.path().join("escape.txt"), b"outside");
+
+            let (mut a, mut b) = loopback_pair();
+            let out2 = out.clone();
+            let recv = tokio::spawn(async move {
+                run_receiver(&mut b, &out2, SyncOptions { replace_delete: true, confirm_all: true })
+                    .await
+            });
+            a.send(&Frame::Control(ControlFrame::Hello {
+                proto_version: PROTO_VERSION,
+                mode: TransferMode::Sync,
+                folder: Some(hostile.to_string()),
+            }))
+            .await
+            .unwrap();
+
+            let err = recv.await.unwrap().unwrap_err().to_string();
+            assert!(err.contains("unsafe path"), "{hostile:?} → {err}");
+            // Nothing created, nothing deleted, nothing escaped.
+            assert_eq!(fs::read(out.join("precious.txt")).unwrap(), b"mine");
+            assert_eq!(fs::read(tmp.path().join("escape.txt")).unwrap(), b"outside");
+            assert!(!tmp.path().join("escape").exists());
+            assert_eq!(fs::read_dir(&out).unwrap().count(), 1, "{hostile:?} created something");
+
+            // …and the peer was told why.
+            let mut aborted = None;
+            while let Ok(frame) = a.recv().await {
+                if let Frame::Control(ControlFrame::Abort { reason }) = frame {
+                    aborted = Some(reason);
+                    break;
+                }
+            }
+            assert!(
+                aborted.is_some_and(|r| r.contains("unsafe path")),
+                "the receiver must send a typed abort for {hostile:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sync_hello_without_a_folder_name_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let (mut a, mut b) = loopback_pair();
+        let out2 = out.clone();
+        let recv =
+            tokio::spawn(async move { run_receiver(&mut b, &out2, SyncOptions::default()).await });
+        a.send(&Frame::Control(ControlFrame::Hello {
+            proto_version: PROTO_VERSION,
+            mode: TransferMode::Sync,
+            folder: None,
+        }))
+        .await
+        .unwrap();
+        let err = recv.await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("did not name the shared folder"), "{err}");
+        assert!(!out.exists(), "a folder-less hello may not create the output dir");
+    }
+
+    #[test]
+    fn the_shared_folder_name_is_the_directory_base_name() {
+        assert_eq!(source_folder_name(Path::new("/x/y/abc")).unwrap(), "abc");
+        assert_eq!(source_folder_name(Path::new("/x/y/abc/")).unwrap(), "abc");
+        // A filesystem root cannot name a sync root — refuse rather than fall
+        // back to the bare output directory.
+        assert!(source_folder_name(Path::new("/")).is_err());
+    }
+
+    #[tokio::test]
+    async fn fat_finger_guard_keeps_files_when_the_source_is_empty() {
+        // Now that the root is the *shared folder's* name, an empty source only
+        // meets a populated root when it carries the same name — so the source is
+        // an empty `proj` in its own parent, mirroring a wiped-out workspace.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("wiped/proj");
+        let out = tmp.path().join("out");
+        let dst = sync_root_is(&out, &src);
         fs::create_dir_all(&src).unwrap();
         write(&dst.join("precious.txt"), b"do not delete");
 
         let opts = SyncOptions { replace_delete: true, confirm_all: false };
-        let (_, r, _, _) = sync_once(&src, &dst, opts).await.unwrap();
+        let (_, r, _, _) = sync_once(&src, &out, opts).await.unwrap();
         assert_eq!(r.deleted, 0);
         assert_eq!(r.kept, 1);
         assert_eq!(fs::read(dst.join("precious.txt")).unwrap(), b"do not delete");
 
         // --yes overrides the guard.
         let opts = SyncOptions { replace_delete: true, confirm_all: true };
-        let (_, r, _, _) = sync_once(&src, &dst, opts).await.unwrap();
+        let (_, r, _, _) = sync_once(&src, &out, opts).await.unwrap();
         assert_eq!(r.deleted, 1);
         assert!(!dst.join("precious.txt").exists());
     }
@@ -1067,14 +1341,17 @@ mod tests {
     #[tokio::test]
     async fn an_unsafe_path_aborts_the_run_with_nothing_written() {
         let tmp = tempfile::tempdir().unwrap();
-        let dst = tmp.path().join("dst");
+        let out = tmp.path().join("out");
+        let dst = out.join("proj");
         let (mut a, mut b) = loopback_pair();
-        let dst2 = dst.clone();
+        let out2 = out.clone();
         let recv = tokio::spawn(async move {
-            run_receiver(&mut b, &dst2, SyncOptions::default()).await.map(|_| ())
+            run_receiver(&mut b, &out2, SyncOptions::default()).await.map(|_| ())
         });
 
-        a.send(&Frame::Control(hello_frame(TransferMode::Sync))).await.unwrap();
+        a.send(&Frame::Control(hello_frame(TransferMode::Sync, Some("proj".into()))))
+            .await
+            .unwrap();
         a.send(&Frame::Control(ControlFrame::Manifest {
             files: vec![FileEntry {
                 path: "../escape.txt".into(),
@@ -1090,6 +1367,7 @@ mod tests {
         let err = recv.await.unwrap().unwrap_err();
         assert!(err.to_string().contains("unsafe path"), "{err}");
         assert!(!tmp.path().join("escape.txt").exists());
+        assert!(!out.join("escape.txt").exists());
         assert!(scan_dest(&dst).unwrap().is_empty(), "nothing may be written");
         // …and the receiver told the peer why (after its own hello).
         let mut aborted = None;
@@ -1106,31 +1384,36 @@ mod tests {
     #[tokio::test]
     async fn a_version_mismatch_aborts_cleanly() {
         let tmp = tempfile::tempdir().unwrap();
-        let dst = tmp.path().join("dst");
+        let out = tmp.path().join("out");
         let (mut a, mut b) = loopback_pair();
-        let dst2 = dst.clone();
+        let out2 = out.clone();
         let recv = tokio::spawn(async move {
-            run_receiver(&mut b, &dst2, SyncOptions::default()).await.map(|_| ())
+            run_receiver(&mut b, &out2, SyncOptions::default()).await.map(|_| ())
         });
         a.send(&Frame::Control(ControlFrame::Hello {
             proto_version: 99,
             mode: TransferMode::Sync,
+            folder: Some("proj".into()),
         }))
         .await
         .unwrap();
         let err = recv.await.unwrap().unwrap_err();
         assert!(err.to_string().contains("version mismatch"), "{err}");
+        assert!(!out.exists(), "a rejected hello may not create anything");
     }
 
     #[tokio::test]
     async fn a_hash_mismatch_is_rejected_and_leaves_no_file() {
         let tmp = tempfile::tempdir().unwrap();
-        let dst = tmp.path().join("dst");
+        let out = tmp.path().join("out");
+        let dst = out.join("proj");
         let (mut a, mut b) = loopback_pair();
-        let dst2 = dst.clone();
-        let recv = tokio::spawn(async move { run_receiver(&mut b, &dst2, SyncOptions::default()).await });
+        let out2 = out.clone();
+        let recv = tokio::spawn(async move { run_receiver(&mut b, &out2, SyncOptions::default()).await });
 
-        a.send(&Frame::Control(hello_frame(TransferMode::Sync))).await.unwrap();
+        a.send(&Frame::Control(hello_frame(TransferMode::Sync, Some("proj".into()))))
+            .await
+            .unwrap();
         a.send(&Frame::Control(ControlFrame::Manifest { files: vec![], more: false }))
             .await
             .unwrap();
@@ -1170,8 +1453,9 @@ mod tests {
         }))
         .await
         .unwrap();
-        let summary = recv.await.unwrap().unwrap();
+        let (root, summary) = recv.await.unwrap().unwrap();
         assert_eq!(summary.files_sent, 0);
+        assert_eq!(root.file_name().unwrap(), "proj", "the run reports its resolved root");
     }
 
     #[tokio::test]
@@ -1181,13 +1465,16 @@ mod tests {
         // with a size that disagrees with the manifest — and that must NOT be an
         // error, or every log/db file under active write would fail the sync.
         let tmp = tempfile::tempdir().unwrap();
-        let dst = tmp.path().join("dst");
+        let out = tmp.path().join("out");
+        let dst = out.join("proj");
         let (mut a, mut b) = loopback_pair();
-        let dst2 = dst.clone();
+        let out2 = out.clone();
         let recv =
-            tokio::spawn(async move { run_receiver(&mut b, &dst2, SyncOptions::default()).await });
+            tokio::spawn(async move { run_receiver(&mut b, &out2, SyncOptions::default()).await });
 
-        a.send(&Frame::Control(hello_frame(TransferMode::Sync))).await.unwrap();
+        a.send(&Frame::Control(hello_frame(TransferMode::Sync, Some("proj".into()))))
+            .await
+            .unwrap();
         a.send(&Frame::Control(ControlFrame::Manifest { files: vec![], more: false }))
             .await
             .unwrap();
@@ -1223,7 +1510,7 @@ mod tests {
         }))
         .await
         .unwrap();
-        assert_eq!(recv.await.unwrap().unwrap().files_sent, 1);
+        assert_eq!(recv.await.unwrap().unwrap().1.files_sent, 1);
     }
 
     #[tokio::test]

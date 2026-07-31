@@ -239,10 +239,15 @@ async fn run_sync_receive<W: super::sync_flow::Wire>(
         // Meaningless rather than wrong: scripts may pass it unconditionally.
         super::log::event("--no-extract ignored: a direct sync has no archive");
     }
-    let dest = PathBuf::from(output_dir.unwrap_or("."));
-    let summary = super::sync_flow::run_receiver(wire, &dest, opts.sync_options()).await?;
+    // `-o` is only the *parent*: the sender names the folder it is sharing and the
+    // whole run is scoped to `<output_dir>/<folder>` (task 064). Nothing outside
+    // that root is read, written or deleted — which is what keeps a bare
+    // `get <sync-link>` from scanning (or, with --replace-delete, pruning) the
+    // entire current directory.
+    let base = PathBuf::from(output_dir.unwrap_or("."));
+    let (root, summary) = super::sync_flow::run_receiver(wire, &base, opts.sync_options()).await?;
     super::log::blank();
-    super::display::status(&super::sync_flow::format_receiver_summary(&dest, &summary));
+    super::display::status(&super::sync_flow::format_receiver_summary(&root, &summary));
     Ok(())
 }
 
