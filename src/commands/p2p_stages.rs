@@ -135,6 +135,61 @@ pub async fn await_offer(events: &mut P2PEvents, first_attempt: bool) -> Result<
     }
 }
 
+/// What a `--local` sender opened with (task 062).
+#[derive(Debug)]
+pub enum LocalStart {
+    /// A folder sync: the payload is the `p2p:metadata` announcement carrying the
+    /// sender's TCP data port. LAN sync never negotiates WebRTC at all.
+    SyncOverTcp(Value),
+    /// A single-payload transfer: the payload is the SDP offer, which the caller
+    /// feeds to the existing WebRTC receive loop.
+    Offer(Value),
+}
+
+/// Receiver side of `--local`: wait for whichever of the two the sender sends
+/// first. A LAN sender announces its data port over signaling; a plain file
+/// sender sends an SDP offer.
+///
+/// Unbounded like `await_offer`'s first attempt (bug B3): a `--local` recipient
+/// is expected to sit and wait for its sender.
+pub async fn await_local_start(events: &mut P2PEvents) -> Result<LocalStart> {
+    loop {
+        tokio::select! {
+            biased;
+            m = events.metadata.recv() => {
+                match m {
+                    Some(payload) if crate::commands::sync_tcp::is_sync_announcement(&payload) => {
+                        crate::commands::log::event("sync data-port announcement received");
+                        return Ok(LocalStart::SyncOverTcp(payload));
+                    }
+                    // Anything else relayed on p2p:metadata is not ours to act on.
+                    Some(_) => continue,
+                    None => bail!("socket closed before the sender started"),
+                }
+            }
+            o = events.offer.recv() => {
+                match o {
+                    Some(offer) => {
+                        crate::commands::log::event("offer received");
+                        return Ok(LocalStart::Offer(offer));
+                    }
+                    None => bail!("socket closed before offer"),
+                }
+            }
+            err = events.error.recv() => {
+                if let Some(code) = err {
+                    if is_fatal_signaling_error(&code) {
+                        bail!("signaling error: {code}");
+                    }
+                    // Recoverable (e.g. peer_timeout): the sender hasn't
+                    // (re)joined yet — keep waiting.
+                    crate::commands::log::event(&format!("waiting for sender ({code})…"));
+                }
+            }
+        }
+    }
+}
+
 /// The peer side of `await_answer`, so the timeout path can be unit-tested
 /// without binding a UDP socket or spawning a WebRTC event loop.
 pub trait AnswerSink {

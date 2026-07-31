@@ -33,6 +33,14 @@ pub const CHANNEL_TIMEOUT_SECS: u64 = 10;
 /// with no output at any verbosity.
 pub const ANSWER_TIMEOUT_SECS: u64 = 30;
 
+/// Timeout for the `--sync --local` TCP data connection (task 062): the sender
+/// waiting to `accept`, the receiver waiting to `connect` + finish the handshake.
+///
+/// By this point signaling has already succeeded, so the only thing left that can
+/// stall is the data port itself (a firewall or endpoint agent dropping the SYN).
+/// Bounded on purpose — an unbounded wait here would repeat bug B3 / task 060.
+pub const SYNC_DATA_TIMEOUT_SECS: u64 = 30;
+
 /// Prompt user to manually retry after auto-retries are exhausted.
 /// Returns `true` if user wants to retry, `false` to abort.
 /// In non-interactive mode (piped stdin), returns `false`.

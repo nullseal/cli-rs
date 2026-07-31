@@ -211,11 +211,6 @@ async fn receive_sync(
 ) -> Result<()> {
     use super::sync_flow::{ReceiverWire, Sealer, Unsealer};
 
-    if opts.no_extract {
-        // Meaningless rather than wrong: scripts may pass it unconditionally.
-        super::log::event("--no-extract ignored: a direct sync has no archive");
-    }
-    let dest = PathBuf::from(output_dir.unwrap_or("."));
     let sealer = Sealer::new(password);
     receiver
         .send_frame(
@@ -229,7 +224,23 @@ async fn receive_sync(
 
     let mut wire =
         ReceiverWire { peer: receiver, sealer, unsealer: Unsealer::new(sender_meta, password)? };
-    let summary = super::sync_flow::run_receiver(&mut wire, &dest, opts.sync_options()).await?;
+    run_sync_receive(&mut wire, output_dir, opts).await
+}
+
+/// The transport-independent half of a sync receive: run the engine loop, then
+/// print the run summary. Shared by the WebRTC receiver (`--p2p`) and the LAN
+/// TCP receiver (`--local`, task 062) so both report identically.
+async fn run_sync_receive<W: super::sync_flow::Wire>(
+    wire: &mut W,
+    output_dir: Option<&str>,
+    opts: ExtractOpts,
+) -> Result<()> {
+    if opts.no_extract {
+        // Meaningless rather than wrong: scripts may pass it unconditionally.
+        super::log::event("--no-extract ignored: a direct sync has no archive");
+    }
+    let dest = PathBuf::from(output_dir.unwrap_or("."));
+    let summary = super::sync_flow::run_receiver(wire, &dest, opts.sync_options()).await?;
     super::log::blank();
     super::display::status(&super::sync_flow::format_receiver_summary(&dest, &summary));
     Ok(())
@@ -758,10 +769,36 @@ pub async fn run_local(
         .ok_or_else(|| anyhow::anyhow!("socket closed before joined"))?;
     super::log::step("Connected. Waiting for sender…");
 
+    // 4. What kind of transfer is this? A folder sync announces a TCP data port
+    //    over signaling and never negotiates WebRTC (task 062); a single-payload
+    //    transfer opens with an SDP offer and takes the loop below. LAN mints no
+    //    URL, so the sender's declaration is the only mode signal here (spec §3a).
+    let pending_offer = match super::p2p_stages::await_local_start(&mut control.events).await? {
+        super::p2p_stages::LocalStart::SyncOverTcp(announcement) => {
+            let data_addr = super::sync_tcp::data_addr(&addr, &announcement)?;
+            super::log::step(&format!("Opening the sync data connection to {data_addr} (TCP)…"));
+            let mut wire = super::sync_tcp::connect_data(&data_addr, &password).await?;
+            super::log::event(&format!("sync data connection to {} established (TCP — no ICE, no UDP)", wire.peer_addr()));
+
+            let result = run_sync_receive(&mut wire, output_dir.as_deref(), extract_opts).await;
+            wire.shutdown().await;
+
+            let _ = control.complete("recipient", &sha256_hex("sync"));
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                control.events.deleted.recv(),
+            )
+            .await;
+            return result;
+        }
+        super::p2p_stages::LocalStart::Offer(offer) => Some(offer),
+    };
+
     // `addr` is the SENDER's address. Our ICE host candidate must advertise
     // *our* address, not theirs — see `webrtc::receiver_bind_ip` (loopback
     // senders keep loopback so same-machine runs are unchanged).
     let bind_ip: Option<std::net::IpAddr> = crate::webrtc::receiver_bind_ip(&addr);
+    let mut pending_offer = pending_offer;
 
     // Shared receive types (sha256_bytes is already in module scope)
     use crate::crypto::{StreamDecryptor, StreamEncryptionMetadata};
@@ -807,9 +844,6 @@ pub async fn run_local(
     let mut plaintext_buf: Vec<u8> = Vec::new();
     let mut content_type = String::new();
     let mut file_meta: Option<serde_json::Value> = None;
-    // LAN mints no URL, so the sender's declaration is the ONLY mode signal here
-    // (spec §3a) — `get --local` adapts with no extra flag.
-    let mut sync_meta: Option<crate::crypto::StreamEncryptionMetadata> = None;
 
     macro_rules! rejoin {
         () => {{
@@ -847,10 +881,15 @@ pub async fn run_local(
     }
 
     let checksum = loop {
-        // 5. Wait for the sender's offer. (Stale offer/ice are drained inside rejoin!
-        //    BEFORE re-joining, so a fresh offer relayed right after both-ready over
-        //    loopback isn't accidentally discarded here.)
-        let offer = match super::p2p_stages::await_offer(&mut control.events, machine.attempts() == 0).await? {
+        // 5. Wait for the sender's offer. The first attempt already has it — the
+        //    mode probe above consumed it. (Stale offer/ice are drained inside
+        //    rejoin! BEFORE re-joining, so a fresh offer relayed right after
+        //    both-ready over loopback isn't accidentally discarded here.)
+        let next_offer = match pending_offer.take() {
+            Some(o) => Some(o),
+            None => super::p2p_stages::await_offer(&mut control.events, machine.attempts() == 0).await?,
+        };
+        let offer = match next_offer {
             Some(o) => o,
             None => {
                 machine_retry!(
@@ -928,12 +967,9 @@ pub async fn run_local(
                             v["streamEncryptionMetadata"].clone()
                         ).map_err(|e| anyhow::anyhow!("invalid stream metadata: {e}"))?;
 
-                        // Folder sync over the LAN (task 058) — hand over below.
-                        if content_type == SYNC_CONTENT_TYPE {
-                            sync_meta = Some(stream_meta);
-                            return Err(anyhow::anyhow!(SYNC_HANDOVER));
-                        }
-
+                        // A LAN folder sync never reaches this loop: it is announced
+                        // over signaling and carried on TCP (task 062), handled
+                        // before the WebRTC negotiation above.
                         total_plaintext_size = stream_meta.total_plaintext_size as usize;
                         let resume_from = v["resumeFromChunk"].as_u64().unwrap_or(0);
                         super::log::event(&format!(
@@ -1009,22 +1045,6 @@ pub async fn run_local(
 
         // Restore the peer_disconnected receiver (see run_p2p). (task 022)
         control.events.peer_disconnected = peer_disconnected;
-
-        // Folder sync over the LAN (task 058): the hello/metadata declared a
-        // direct multi-file transfer, so the sync receiver takes over.
-        if let Some(meta) = sync_meta.take() {
-            let result =
-                receive_sync(&mut receiver, &password, output_dir.as_deref(), &meta, extract_opts)
-                    .await;
-            receiver.close_and_flush().await;
-            let _ = control.complete("recipient", &sha256_hex("sync"));
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                control.events.deleted.recv(),
-            )
-            .await;
-            return result;
-        }
 
         match transfer_result {
             Ok(checksum) => {

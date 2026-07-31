@@ -6,6 +6,7 @@ pub mod manage;
 pub mod p2p_stages;
 pub mod share;
 pub mod sync_flow;
+pub mod sync_tcp;
 
 /// Map an `ApiError` from a first server call to an anyhow error, appending an
 /// actionable connectivity hint ONLY for connection-class failures (couldn't

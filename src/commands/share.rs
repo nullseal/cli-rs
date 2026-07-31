@@ -973,6 +973,13 @@ async fn run_sync_online(
 
 /// `share <dir> --sync --local [-a host:port]` — direct folder sync over the LAN.
 /// This is the documented unattended/cron path (`guides/setup.md`).
+///
+/// The frames travel over a **plain TCP** socket, not a WebRTC DataChannel
+/// (task 062): ICE/DTLS buy nothing between two hosts on one subnet, and a
+/// UDP-blocking endpoint agent kills the DataChannel outright. Signaling is
+/// unchanged — the relay below still pairs the two peers and now also carries the
+/// data-port announcement. Every frame is already sealed by `sync_flow::Sealer`,
+/// so dropping DTLS costs nothing in confidentiality.
 async fn run_sync_local(
     content: &str,
     password: &str,
@@ -984,7 +991,8 @@ async fn run_sync_local(
         .map_err(|e| anyhow::anyhow!("cannot access folder \"{content}\": {e}"))?;
     let (files, _) = scan_shared_folder(&source, excludes)?;
 
-    let proof = sha256_hex(password);
+    // No `verify` frame here: on the TCP path the seal itself is the gate — a peer
+    // without the password cannot produce a frame that unseals (see `sync_tcp`).
     let local_ip = match &bind_addr {
         Some(a) if a.contains(':') => a.rsplitn(2, ':').last().unwrap().to_string(),
         Some(ip) => ip.clone(),
@@ -1013,17 +1021,27 @@ async fn run_sync_local(
     }
     super::display::status("Recipient connected. Starting sync…");
 
-    let bind_ip: Option<std::net::IpAddr> = local_ip.parse().ok();
-    let mut sender = SenderPeer::new(vec![], bind_ip).await?;
-    control.offer(&sender.offer_sdp_json())?;
-    super::p2p_stages::await_answer(&sender, &mut control.events).await?;
-    if !super::p2p_stages::await_sender_channel(&mut sender, &mut control.events).await? {
-        bail!("DataChannel open failed.");
-    }
+    // Bind the data listener on the same IP the relay uses, so `-a <ip>` and mDNS
+    // discovery keep pointing at a reachable address, then announce the port over
+    // the signaling channel the two peers already share.
+    let listener = super::sync_tcp::bind_data_listener(&local_ip).await?;
+    let data_port = listener.local_addr()?.port();
+    control.metadata(&super::sync_tcp::announce(&local_ip, data_port))?;
+    super::log::event(&format!(
+        "sync data listener on {local_ip}:{data_port} (TCP — no ICE, no UDP)"
+    ));
 
-    let summary = sync_send_over_channel(&mut sender, password, &proof, &source, files).await;
-    sender.close_and_flush().await;
-    sender.wait_closed().await;
+    let mut wire = super::sync_tcp::accept_data(listener, password).await?;
+    super::log::event(&format!("sync data connection from {} (TCP)", wire.peer_addr()));
+
+    let summary = super::sync_flow::run_sender(
+        &mut wire,
+        &source,
+        files,
+        crate::crypto::STREAM_CHUNK_SIZE,
+    )
+    .await;
+    wire.shutdown().await;
     let summary = summary?;
 
     super::log::blank();
