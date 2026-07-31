@@ -210,27 +210,33 @@ fn print_qr(url: &str) {
 
 /// Print a success status message (a milestone). Routed through the leveled
 /// logger: shown in Normal + Verbose, suppressed in Pipe.
+///
+/// Written at `log::MARGIN`, like every other human-facing line. (067)
 pub fn status(msg: &str) {
     if super::log::is_pipe() {
         return;
     }
+    let margin = super::log::MARGIN;
     if super::log::stderr_is_tty() {
-        eprintln!("\x1b[1;32m✓\x1b[0m {msg}");
+        eprintln!("{margin}\x1b[1;32m✓\x1b[0m {msg}");
     } else {
-        eprintln!("✓ {msg}");
+        eprintln!("{margin}✓ {msg}");
     }
 }
 
 /// Print a warning message (a milestone). Suppressed in Pipe.
+///
+/// Same margin as everything else — the bold-yellow `⚠` is the emphasis. (067)
 #[allow(dead_code)]
 pub fn warn(msg: &str) {
     if super::log::is_pipe() {
         return;
     }
+    let margin = super::log::MARGIN;
     if super::log::stderr_is_tty() {
-        eprintln!("\x1b[1;33m⚠\x1b[0m {msg}");
+        eprintln!("{margin}\x1b[1;33m⚠\x1b[0m {msg}");
     } else {
-        eprintln!("⚠ {msg}");
+        eprintln!("{margin}⚠ {msg}");
     }
 }
 
@@ -264,11 +270,12 @@ impl Spinner {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_clone = stop.clone();
         let msg = msg.to_owned();
+        let margin = super::log::MARGIN;
         let handle = std::thread::spawn(move || {
             let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let mut i = 0;
             while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                eprint!("\r\x1b[1;36m{}\x1b[0m {}\x1b[K", frames[i % frames.len()], msg);
+                eprint!("\r{margin}\x1b[1;36m{}\x1b[0m {}\x1b[K", frames[i % frames.len()], msg);
                 i += 1;
                 std::thread::sleep(std::time::Duration::from_millis(80));
             }

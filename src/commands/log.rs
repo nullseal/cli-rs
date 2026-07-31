@@ -20,6 +20,20 @@
 use std::io::{IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
+/// The one left margin every human-facing line is written at (task 067).
+///
+/// `display.rs` has always indented its result boxes and status lines two
+/// columns, while the `step`/`error`/`event` family started at column 0 — so a
+/// real run had a ragged left edge with two competing columns. Everything a
+/// human reads now hangs off this margin: steps, errors, warnings, retries,
+/// verbose events, the progress counter and the spinner. Pipe mode is exempt by
+/// construction — it emits only [`result`] on stdout, which never gets a margin.
+pub const MARGIN: &str = "  ";
+
+/// The step glyph. Every milestone carries one so the glyph column is uniform:
+/// a bare line among prefixed ones reads as misaligned even at the right indent.
+pub const GLYPH_STEP: &str = "›";
+
 /// Output verbosity, derived from the `--pipe` / `--verbose` flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verbosity {
@@ -106,12 +120,27 @@ pub fn blank() {
 
 /// A main milestone (e.g. "Creating session…", "Transfer complete").
 /// Shown in Normal + Verbose; suppressed in Pipe.
+///
+/// Rendered at [`MARGIN`] with the [`GLYPH_STEP`] prefix. Call sites pass the
+/// message only — never their own glyph — so the column stays uniform. (067)
 pub fn step(s: &str) {
+    step_glyph(GLYPH_STEP, s);
+}
+
+/// A milestone that carries a glyph other than `›` — `↻` for resume/reconnect,
+/// `✓` for a completed sub-step. Same margin as [`step`]; only the glyph differs.
+/// The `glyph` may embed its own ANSI styling.
+pub fn step_glyph(glyph: &str, s: &str) {
     if is_pipe() {
         return;
     }
     finish_progress();
-    eprintln!("{s}");
+    eprintln!("{}", format_line(glyph, s));
+}
+
+/// Compose one human-facing line: margin, glyph, message. (Pure — for testing.)
+fn format_line(glyph: &str, s: &str) -> String {
+    format!("{MARGIN}{glyph} {s}")
 }
 
 /// Format the retry-attempt line. The technical `reason` is appended only in
@@ -140,36 +169,44 @@ pub fn attempt(n: u32, max: u32, reason: &str) {
     finish_progress();
     let line = format_attempt(n, max, reason, is_verbose());
     if stderr_is_tty() {
-        eprintln!("\x1b[1;33m↻\x1b[0m {line}");
+        eprintln!("{MARGIN}\x1b[1;33m↻\x1b[0m {line}");
     } else {
-        eprintln!("{line}");
+        eprintln!("{MARGIN}↻ {line}");
     }
 }
 
 /// A lifecycle / transport event (the debug firehose). Verbose only.
+///
+/// Shares the standard [`MARGIN`]: verbose lines interleave with the very
+/// milestones they explain, so hanging them at column 0 would rebuild the exact
+/// ragged edge 067 removed. The dim `·` glyph already sets them apart. (067)
 pub fn event(s: &str) {
     if !is_verbose() {
         return;
     }
     finish_progress();
     if stderr_is_tty() {
-        eprintln!("\x1b[2m·\x1b[0m {s}");
+        eprintln!("{MARGIN}\x1b[2m·\x1b[0m {s}");
     } else {
-        eprintln!("· {s}");
+        eprintln!("{MARGIN}· {s}");
     }
 }
 
 /// An error message. Shown on stderr in Normal + Verbose; suppressed in Pipe
 /// (Pipe signals failure via exit code only).
+///
+/// Shares the standard [`MARGIN`]. The bold-red `✗` carries the emphasis; two
+/// columns of whitespace would not add any, and a flush-left error next to an
+/// indented step reads as a layout bug rather than a warning. (067)
 pub fn error(s: &str) {
     if is_pipe() {
         return;
     }
     finish_progress();
     if stderr_is_tty() {
-        eprintln!("\x1b[1;31m✗\x1b[0m {s}");
+        eprintln!("{MARGIN}\x1b[1;31m✗\x1b[0m {s}");
     } else {
-        eprintln!("✗ {s}");
+        eprintln!("{MARGIN}✗ {s}");
     }
 }
 
@@ -193,7 +230,9 @@ fn progress(label: &str, done: usize, total: usize) {
     let mut err = std::io::stderr();
     if stderr_is_tty() {
         // Overwrite the current line with the live counter.
-        let _ = write!(err, "\r{label}: {done}/{total}\x1b[K");
+        // Margin + step glyph, same as every milestone: a bare counter sitting
+        // between two `›` lines reads as misaligned. (task 067)
+        let _ = write!(err, "\r{MARGIN}{GLYPH_STEP} {label}: {done}/{total}\x1b[K");
         let _ = err.flush();
         // A live line is now pending (no trailing newline) — mark it so the next
         // non-progress write terminates it. On the final tick, end it here. (task 033)
@@ -207,7 +246,7 @@ fn progress(label: &str, done: usize, total: usize) {
         // Non-TTY: emit one line per update would flood; only emit at the end
         // (done == total) so piped logs stay readable without ANSI rewrites.
         if done == total {
-            let _ = writeln!(err, "{label}: {done}/{total}");
+            let _ = writeln!(err, "{}", format_line(GLYPH_STEP, &format!("{label}: {done}/{total}")));
         }
     }
 }
@@ -239,6 +278,35 @@ mod tests {
             format_attempt(1, 3, "DataChannel closed", true),
             "Connection interrupted, retrying (1/3) — DataChannel closed"
         );
+    }
+
+    #[test]
+    fn step_lines_carry_the_margin_and_step_glyph() {
+        // Task 067: one left margin, one glyph column. A step never starts at
+        // column 0 and never goes out bare.
+        assert_eq!(format_line(GLYPH_STEP, "Finishing up…"), "  › Finishing up…");
+        assert!(format_line(GLYPH_STEP, "x").starts_with(MARGIN));
+    }
+
+    #[test]
+    fn every_glyph_shares_one_margin() {
+        // ✓ / ↻ / ✗ / ⚠ / · all hang off the same two columns, so the glyph
+        // column stays vertically aligned across a whole run.
+        for glyph in [GLYPH_STEP, "✓", "↻", "✗", "⚠", "·"] {
+            let line = format_line(glyph, "msg");
+            assert!(line.starts_with(MARGIN), "{glyph} line must be indented");
+            assert_eq!(
+                line.chars().take_while(|c| *c == ' ').count(),
+                MARGIN.len(),
+                "{glyph} line must use exactly the standard margin"
+            );
+        }
+    }
+
+    #[test]
+    fn margin_is_two_columns() {
+        // display.rs boxes are drawn at this indent; the log column must match.
+        assert_eq!(MARGIN, "  ");
     }
 
     #[test]

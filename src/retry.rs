@@ -54,8 +54,10 @@ pub async fn prompt_manual() -> bool {
     if crate::commands::log::is_pipe() {
         return false;
     }
-    eprintln!("\x1b[1;33m\u{26a0}\x1b[0m The connection was not successful.");
-    eprint!("Press Enter to retry or Ctrl+C to quit\u{2026} ");
+    // Same margin as the log column this prompt interrupts. (task 067)
+    let margin = crate::commands::log::MARGIN;
+    eprintln!("{margin}\x1b[1;33m\u{26a0}\x1b[0m The connection was not successful.");
+    eprint!("{margin}Press Enter to retry or Ctrl+C to quit\u{2026} ");
     let mut buf = String::new();
     let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
     use tokio::io::AsyncBufReadExt;
@@ -64,7 +66,7 @@ pub async fn prompt_manual() -> bool {
         Ok(_) => {
             // Immediate feedback so a manual retry visibly does something (the web
             // shows "Reconnecting"); the next stage then waits for the peer.
-            crate::commands::log::step("\x1b[1;34m\u{21bb}\x1b[0m Reconnecting\u{2026}");
+            crate::commands::log::step_glyph("\x1b[1;34m\u{21bb}\x1b[0m", "Reconnecting\u{2026}");
             true
         }
     }

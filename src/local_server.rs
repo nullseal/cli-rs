@@ -58,7 +58,7 @@ pub async fn start(ip: &str) -> anyhow::Result<(SocketAddr, tokio::task::JoinHan
 
     let listener = tokio::net::TcpListener::bind(format!("{ip}:0")).await?;
     let addr = listener.local_addr()?;
-    crate::commands::log::step(&format!("› Local relay server on {addr}"));
+    crate::commands::log::step(&format!("Local relay server on {addr}"));
 
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.ok();

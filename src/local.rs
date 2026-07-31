@@ -21,7 +21,7 @@ pub fn broadcast(share_url: &str) -> Result<BroadcastGuard> {
     )?;
 
     mdns.register(info)?;
-    crate::commands::log::step("› Broadcasting on local network…");
+    crate::commands::log::step("Broadcasting on local network…");
 
     Ok(BroadcastGuard { mdns })
 }
@@ -33,7 +33,7 @@ pub fn discover(timeout: Duration) -> Result<String> {
     let mdns = ServiceDaemon::new()?;
     let receiver = mdns.browse(SERVICE_TYPE)?;
 
-    crate::commands::log::step("› Searching for shares on local network…");
+    crate::commands::log::step("Searching for shares on local network…");
 
     let deadline = std::time::Instant::now() + timeout;
 
@@ -47,8 +47,8 @@ pub fn discover(timeout: Duration) -> Result<String> {
         match receiver.recv_timeout(remaining) {
             Ok(ServiceEvent::ServiceResolved(info)) => {
                 if let Some(url) = info.get_property_val_str("url") {
-                    crate::commands::log::step(&format!(
-                        "✓ Found share from {}",
+                    crate::commands::log::step_glyph("✓", &format!(
+                        "Found share from {}",
                         info.get_hostname().trim_end_matches('.')
                     ));
                     mdns.shutdown().ok();
@@ -86,7 +86,7 @@ pub fn broadcast_addr(ip: &str, port: u16) -> Result<BroadcastGuard> {
     )?;
 
     mdns.register(info)?;
-    crate::commands::log::step("› Broadcasting on local network…");
+    crate::commands::log::step("Broadcasting on local network…");
 
     Ok(BroadcastGuard { mdns })
 }
@@ -96,7 +96,7 @@ pub fn discover_addr(timeout: Duration) -> Result<String> {
     let mdns = ServiceDaemon::new()?;
     let receiver = mdns.browse(SERVICE_TYPE)?;
 
-    crate::commands::log::step("› Searching for shares on local network…");
+    crate::commands::log::step("Searching for shares on local network…");
 
     let deadline = std::time::Instant::now() + timeout;
 
@@ -112,8 +112,8 @@ pub fn discover_addr(timeout: Duration) -> Result<String> {
                 let ip = info.get_property_val_str("ip");
                 let port = info.get_property_val_str("port");
                 if let (Some(ip), Some(port)) = (ip, port) {
-                    crate::commands::log::step(&format!(
-                        "✓ Found share from {}",
+                    crate::commands::log::step_glyph("✓", &format!(
+                        "Found share from {}",
                         info.get_hostname().trim_end_matches('.')
                     ));
                     mdns.shutdown().ok();

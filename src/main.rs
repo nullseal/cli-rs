@@ -232,7 +232,8 @@ enum CheckTarget {
 }
 
 fn prompt_password() -> String {
-    eprint!("\x1b[1;33m› Password:\x1b[0m ");
+    // Same margin as the log column it sits in. (task 067)
+    eprint!("{}\x1b[1;33m› Password:\x1b[0m ", commands::log::MARGIN);
     io::stderr().flush().ok();
     rpassword::read_password().unwrap_or_default()
 }
@@ -256,10 +257,16 @@ enum DestroyConfirm {
 fn confirm_destroy() -> DestroyConfirm {
     use std::io::IsTerminal;
     if !io::stdin().is_terminal() {
-        eprintln!("Refusing to destroy without confirmation. Re-run with --yes.");
+        eprintln!(
+            "{}Refusing to destroy without confirmation. Re-run with --yes.",
+            commands::log::MARGIN
+        );
         return DestroyConfirm::NoTty;
     }
-    eprint!("This permanently destroys the share and cannot be undone. Type 'yes' to confirm: ");
+    eprint!(
+        "{}This permanently destroys the share and cannot be undone. Type 'yes' to confirm: ",
+        commands::log::MARGIN
+    );
     io::stderr().flush().ok();
     let mut line = String::new();
     if io::stdin().read_line(&mut line).is_err() {
@@ -458,7 +465,7 @@ async fn async_main() {
                 match confirm_destroy() {
                     DestroyConfirm::Confirmed => {}
                     DestroyConfirm::Declined => {
-                        eprintln!("Aborted.");
+                        eprintln!("{}Aborted.", commands::log::MARGIN);
                         std::process::exit(1);
                     }
                     DestroyConfirm::NoTty => std::process::exit(1),

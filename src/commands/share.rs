@@ -581,7 +581,7 @@ pub async fn run_local_with_excludes(
         // 7c. Resume point from the relay checkpoint (BUG-9/10).
         let start_chunk = last_chunk_offset;
         if start_chunk > 0 {
-            super::log::step(&format!("↻ Resuming from chunk {start_chunk}"));
+            super::log::step_glyph("↻", &format!("Resuming from chunk {start_chunk}"));
         }
 
         sender.send_verify(&proof)?;
@@ -1365,7 +1365,7 @@ async fn run_p2p(
         //     value for its own budget logic, but `last_chunk_offset` is the I/O truth.
         let start_chunk = last_chunk_offset;
         if start_chunk > 0 {
-            super::log::step(&format!("↻ Resuming from chunk {start_chunk}"));
+            super::log::step_glyph("↻", &format!("Resuming from chunk {start_chunk}"));
         }
 
         // 11. Send verify + stream via SenderAdapter (v2 binary protocol)

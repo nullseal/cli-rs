@@ -82,7 +82,10 @@ pub fn confirm_unsafe_file(filename: &str) -> anyhow::Result<()> {
     if !std::io::stdin().is_terminal() {
         return Ok(());
     }
-    eprint!("Warning: \"{}\" has an uncommon extension. Save anyway? [y/N] ", filename);
+    eprint!(
+        "{}Warning: \"{}\" has an uncommon extension. Save anyway? [y/N] ",
+        log::MARGIN, filename
+    );
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
     if !input.trim().eq_ignore_ascii_case("y") {
