@@ -23,7 +23,7 @@ use crate::transfer::engine::{
 };
 use crate::transfer::protocol::{
     decode_message, encode_frame, ControlFrame, FileEntry, Frame, PathHash, TransferError,
-    TransferMode,
+    TransferMode, PROTO_VERSION,
 };
 
 /// Suffix of the temp file a received file occupies until its hash verifies.
@@ -241,14 +241,26 @@ pub async fn run_sender<W: Wire>(
     files: Vec<FileEntry>,
     chunk_size: usize,
 ) -> Result<SyncSummary> {
+    let source_count = files.len();
+    let source_bytes: u64 = files.iter().map(|f| f.size).sum();
     let mut engine = SenderEngine::new(files);
 
     wire.send(&Frame::Control(hello_frame(TransferMode::Sync))).await?;
+    super::log::event(&format!("hello sent (protocol v{PROTO_VERSION}, mode sync)"));
+    let mut batches = 0usize;
     for batch in engine.manifest_batches() {
         wire.send(&Frame::Control(batch)).await?;
+        batches += 1;
     }
+    super::log::event(&format!(
+        "file list sent — {source_count} file(s), {}, in {batches} batch(es)",
+        super::format_size(source_bytes as usize),
+    ));
 
-    // Await the peer's hello + its complete file list.
+    // Await the peer's hello + its complete file list. This is the long pause on
+    // a big tree: the recipient is hashing its own copy before it can answer.
+    super::log::step("Comparing with the recipient…");
+    super::log::event("waiting for the recipient's hello + file list (it is hashing its copy)");
     let mut acks: Vec<PathHash> = Vec::new();
     let (mut got_hello, mut got_ack) = (false, false);
     while !(got_hello && got_ack) {
@@ -261,6 +273,9 @@ pub async fn run_sender<W: Wire>(
                     return Err(e.into());
                 }
                 got_hello = true;
+                super::log::event(&format!(
+                    "recipient hello received (protocol v{proto_version}, mode {mode})"
+                ));
             }
             Frame::Control(ControlFrame::ManifestAck { files, more }) => {
                 acks.extend(files);
@@ -273,6 +288,7 @@ pub async fn run_sender<W: Wire>(
         }
     }
 
+    super::log::event(&format!("recipient's file list received — {} entry(ies)", acks.len()));
     engine.on_manifest_ack(&acks);
     let plan: Vec<FileEntry> = engine.plan().to_vec();
     let delete_paths: Vec<String> = engine.delete_paths().to_vec();
@@ -290,11 +306,23 @@ pub async fn run_sender<W: Wire>(
         ..Default::default()
     };
 
-    for entry in &plan {
+    if !plan.is_empty() {
+        super::log::step(&format!("Transferring {} file(s)…", plan.len()));
+    }
+    for (n, entry) in plan.iter().enumerate() {
         loop {
+            super::log::event(&format!(
+                "sending {} ({}) [{}/{}]",
+                entry.path,
+                super::format_size(entry.size as usize),
+                n + 1,
+                plan.len(),
+            ));
             let sent = send_one_file(wire, source_dir, entry, chunk_size).await?;
+            super::log::event(&format!("{} sent; waiting for the recipient to verify", entry.path));
             match wire.recv().await? {
-                Frame::Control(ControlFrame::FileOk { .. }) => {
+                Frame::Control(ControlFrame::FileOk { path }) => {
+                    super::log::event(&format!("{path} verified and committed by the recipient"));
                     summary.files_sent += 1;
                     summary.bytes += sent;
                     super::display::transfer_progress(
@@ -326,8 +354,13 @@ pub async fn run_sender<W: Wire>(
     }
 
     if !delete_paths.is_empty() {
+        super::log::event(&format!(
+            "announcing {} stale path(s) to the recipient (it prunes only with --replace-delete)",
+            delete_paths.len(),
+        ));
         wire.send(&Frame::Control(ControlFrame::Delete { paths: delete_paths })).await?;
     }
+    super::log::step("Finishing up…");
     wire.send(&Frame::Control(ControlFrame::Done {
         files_sent: summary.files_sent,
         bytes: summary.bytes,
@@ -337,9 +370,13 @@ pub async fn run_sender<W: Wire>(
     .await?;
 
     // The receiver's own Done carries what it actually deleted.
+    super::log::event("done frame sent; waiting for the recipient's summary");
     loop {
         match wire.recv().await? {
             Frame::Control(ControlFrame::Done { deleted, .. }) => {
+                super::log::event(&format!(
+                    "recipient's summary received ({deleted} deleted there)"
+                ));
                 summary.deleted = deleted;
                 summary.kept = summary.kept.saturating_sub(deleted);
                 break;
@@ -421,10 +458,19 @@ pub async fn run_receiver<W: Wire>(
     if stale > 0 {
         super::log::event(&format!("discarded {stale} stale .nullseal-part file(s)"));
     }
+    // Hashing the whole destination is the receiver's longest silent stretch on a
+    // big mirror — announce it before, not after.
+    super::log::step(&format!("Scanning {}…", dest_root.display()));
     let local = scan_dest(dest_root)?;
+    super::log::event(&format!(
+        "destination holds {} file(s) (hashed for the diff)",
+        local.len()
+    ));
     let mut engine = ReceiverEngine::new(local, opts.replace_delete, opts.confirm_all);
 
     wire.send(&Frame::Control(hello_frame(TransferMode::Sync))).await?;
+    super::log::event(&format!("hello sent (protocol v{PROTO_VERSION}, mode sync)"));
+    super::log::step("Comparing with the sender…");
 
     let mut summary = SyncSummary::default();
     let mut current: Option<PartFile> = None;
@@ -438,6 +484,9 @@ pub async fn run_receiver<W: Wire>(
                         abort(wire, &e.to_string()).await;
                         return Err(e.into());
                     }
+                    super::log::event(&format!(
+                        "sender hello received (protocol v{proto_version}, mode {mode})"
+                    ));
                 }
                 Frame::Control(ControlFrame::Manifest { files, more }) => {
                     if let Err(e) = engine.on_manifest(&files, more) {
@@ -450,9 +499,14 @@ pub async fn run_receiver<W: Wire>(
                             "sender declared {} file(s)",
                             engine.source_count()
                         ));
+                        let mut batches = 0usize;
                         for batch in engine.ack_batches() {
                             wire.send(&Frame::Control(batch)).await?;
+                            batches += 1;
                         }
+                        super::log::event(&format!(
+                            "our file list sent back in {batches} batch(es); waiting for the sender's decision"
+                        ));
                     }
                 }
                 Frame::Control(ControlFrame::FileBegin { path, size, mode }) => {
