@@ -8,7 +8,6 @@ use crate::crypto::{encrypt_bytes, generate_challenge};
 use super::SUPPORTED_EXTENSIONS;
 
 const MIN_PASSWORD_LEN: usize = 3;
-const SERVER_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_TEXT_LENGTH: usize = 100_000;
 
 fn server_url(server: Option<&str>) -> Result<String> {
@@ -89,8 +88,12 @@ pub async fn run(
                 );
             }
 
+            // Backend-driven size limit (task 056): same source as `share` —
+            // GET /shares/config, falling back to the compiled-in constant.
+            let server_limit = super::share::fetch_server_limit(&client).await;
+
             // Validate and read content
-            let (bytes, file_metadata) = read_content(&content, new_content_type)?;
+            let (bytes, file_metadata) = read_content(&content, new_content_type, server_limit)?;
 
             // Encrypt
             let content_checksum = crate::crypto::sha256_bytes(&bytes);
@@ -143,7 +146,11 @@ fn resolve_content_type(flag: &str) -> &'static str {
     }
 }
 
-fn read_content(content: &str, content_type: &str) -> Result<(Vec<u8>, Option<FileMetadata>)> {
+fn read_content(
+    content: &str,
+    content_type: &str,
+    max_bytes: u64,
+) -> Result<(Vec<u8>, Option<FileMetadata>)> {
     if content_type == "file" {
         let p = Path::new(content);
         if !p.exists() {
@@ -160,8 +167,10 @@ fn read_content(content: &str, content_type: &str) -> Result<(Vec<u8>, Option<Fi
         if !extension.is_empty() && !SUPPORTED_EXTENSIONS.contains(&extension.as_str()) {
             bail!("Unsupported file extension: {extension}");
         }
-        if bytes.len() as u64 > SERVER_MAX_BYTES {
-            bail!("File exceeds upload limit (2 MB).");
+        // `max_bytes` is the backend-driven limit (task 056), already resolved
+        // by the caller via fetch_server_limit.
+        if bytes.len() as u64 > max_bytes {
+            bail!("File exceeds the server upload limit ({}).", super::format_limit(max_bytes));
         }
         Ok((
             bytes.clone(),
@@ -233,6 +242,52 @@ mod tests {
         .await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn replace_file_uses_server_config_limit() {
+        // Task 056: /shares/config advertises a 1 KB limit → a 2 KB replacement
+        // file is rejected with the dynamic limit in the message; nothing is PUT.
+        use std::io::Write;
+        let (server, uri) = setup().await;
+
+        Mock::given(method("GET"))
+            .and(path("/shares/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "maxBytes": 1024,
+                "maxTtlDays": 7
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/shares/manage/verify"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "shareId": "testshare123",
+                "contentType": "file",
+                "oneTimeRead": false,
+                "expiresAt": "2026-07-01T00:00:00.000Z",
+                "createdAt": "2026-06-20T00:00:00.000Z"
+            })))
+            .mount(&server)
+            .await;
+
+        let mut tmp = tempfile::NamedTempFile::with_suffix(".txt").unwrap();
+        tmp.write_all(&vec![b'x'; 2048]).unwrap();
+        let tmp_path = tmp.path().to_str().unwrap().to_owned();
+
+        let err = run(
+            "testshare123@ownersecret",
+            "replace",
+            Some(tmp_path),
+            Some("hunter2".into()),
+            "file",
+            Some(uri),
+            &mut |_| {},
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.to_string().contains("1 KB"), "expected dynamic limit in error, got: {err}");
     }
 
     // The interactive destroy confirmation prompt and the non-TTY guard live in

@@ -57,6 +57,16 @@ pub struct CreateShareRequest {
     pub content_checksum: String,
 }
 
+/// Public product config from `GET /shares/config` (task 056): the server's
+/// effective (env-driven) share limits, so clients stop hardcoding them.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+pub struct SharesConfigResponse {
+    pub max_bytes: u64,
+    pub max_ttl_days: u64,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 #[allow(dead_code)]
@@ -181,6 +191,18 @@ impl ApiClient {
         format!("{}{path}", self.base_url)
     }
 
+    /// Fetch the server's effective share limits (task 056). Callers treat any
+    /// error (404 on an older server, network failure) as "endpoint
+    /// unavailable" and fall back to their compiled-in constants.
+    pub async fn get_shares_config(&self) -> Result<SharesConfigResponse, ApiError> {
+        let url = self.url("/shares/config");
+        let resp = self.client.get(&url).send().await?;
+        if !resp.status().is_success() {
+            return Err(ApiError::RequestFailed { status: resp.status().as_u16(), url });
+        }
+        Ok(resp.json().await?)
+    }
+
     pub async fn create_share(
         &self,
         payload: CreateShareRequest,
@@ -262,11 +284,23 @@ impl ApiClient {
         &self,
         password_proof: &str,
     ) -> Result<CreateP2PSessionResponse, ApiError> {
+        self.create_p2p_session_with_mode(password_proof, "p2p").await
+    }
+
+    /// Create a P2P session declaring its kind (task 057): `"p2p"` for a plain
+    /// transfer, `"sync"` for a direct folder sync — core mints `/sync/<id>`
+    /// from it, which is how `get` routes to the sync receiver. A pre-057 server
+    /// ignores the field and mints `/p2p/<id>`.
+    pub async fn create_p2p_session_with_mode(
+        &self,
+        password_proof: &str,
+        mode: &str,
+    ) -> Result<CreateP2PSessionResponse, ApiError> {
         let url = self.url("/p2p/sessions");
         let resp = self
             .client
             .post(&url)
-            .json(&serde_json::json!({ "passwordProof": password_proof }))
+            .json(&serde_json::json!({ "passwordProof": password_proof, "mode": mode }))
             .send()
             .await?;
 
@@ -450,6 +484,38 @@ mod tests {
         let server = MockServer::start().await;
         let client = ApiClient::new(server.uri());
         (server, client)
+    }
+
+    #[tokio::test]
+    async fn get_shares_config_parses_limits() {
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/shares/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "maxBytes": 1048576,
+                "maxTtlDays": 7
+            })))
+            .mount(&server)
+            .await;
+
+        let cfg = client.get_shares_config().await.unwrap();
+        assert_eq!(cfg.max_bytes, 1_048_576);
+        assert_eq!(cfg.max_ttl_days, 7);
+    }
+
+    #[tokio::test]
+    async fn get_shares_config_404_is_request_failed() {
+        // An older server without the endpoint → RequestFailed, which callers
+        // treat as "use the compiled-in fallback limit".
+        let (server, client) = setup().await;
+        Mock::given(method("GET"))
+            .and(path("/shares/config"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let err = client.get_shares_config().await.unwrap_err();
+        assert!(matches!(err, ApiError::RequestFailed { status: 404, .. }));
     }
 
     #[tokio::test]

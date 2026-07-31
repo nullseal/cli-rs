@@ -46,6 +46,16 @@ anyhow    = "1"
 rpassword = "7"
 qr2term = "0.3.3"
 
+# Folder shares (task 051) — pure-Rust zip pack/extract compiled into the binary.
+# default-features = false keeps out C-backed codecs (bzip2 …); "deflate" is the
+# pure-Rust miniz_oxide backend, so users install nothing.
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# OS-temp-file lifecycle for the packed archive (auto-removed on drop/error).
+tempfile = "3"
+# Ignore rules + workspace walker (task 052) — gitignore-syntax matcher from
+# ripgrep's pure-Rust `ignore` crate (.nullsealignore + `share --exclude`).
+ignore = "0.4"
+
 # mDNS — local network discovery for -n local P2P sharing
 mdns-sd = "0.11"
 

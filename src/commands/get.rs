@@ -9,8 +9,6 @@ use nullseal_p2p_control::control::P2PControl;
 use nullseal_p2p_control::transport::SocketIoTransport;
 use nullseal_socketio::transport::TungsteniteWs;
 
-use super::confirm_unsafe_file;
-
 const MIN_PASSWORD_LEN: usize = 3;
 
 fn server_url(server: Option<&str>) -> Result<String> {
@@ -27,6 +25,10 @@ fn server_url(server: Option<&str>) -> Result<String> {
 pub enum ParsedUrl {
     Server { id: String },
     P2p { id: String },
+    /// `/sync/<id>` — a folder sync (task 057 mints these; task 058 routes them).
+    /// The prefix is only a routing hint: the sender's hello frame is
+    /// authoritative and a mismatch is reported, never guessed (spec §3a).
+    Sync { id: String },
     BareId { id: String },
 }
 
@@ -37,15 +39,21 @@ pub fn parse_share_url(input: &str) -> ParsedUrl {
             let parts: Vec<&str> = url.path().split('/').filter(|s| !s.is_empty()).collect();
             match parts.as_slice() {
                 ["p2p", id] => return ParsedUrl::P2p { id: id.to_string() },
+                ["sync", id] => return ParsedUrl::Sync { id: id.to_string() },
                 ["s", id] => return ParsedUrl::Server { id: id.to_string() },
                 _ => {}
             }
         }
     }
-    // Support "p2p/ID" and "s/ID" prefix without full URL
+    // Support "p2p/ID", "sync/ID" and "s/ID" prefix without full URL
     if let Some(id) = input.strip_prefix("p2p/") {
         if !id.is_empty() {
             return ParsedUrl::P2p { id: id.to_owned() };
+        }
+    }
+    if let Some(id) = input.strip_prefix("sync/") {
+        if !id.is_empty() {
+            return ParsedUrl::Sync { id: id.to_owned() };
         }
     }
     if let Some(id) = input.strip_prefix("s/") {
@@ -58,12 +66,39 @@ pub fn parse_share_url(input: &str) -> ParsedUrl {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// Options controlling how a received *folder* is handled (task 051 zip shares,
+/// task 058 direct syncs). Plain files and plain user-sent `.zip`s only see
+/// `no_extract`, and that only applies to marked folder shares.
+#[derive(Clone, Copy, Default)]
+pub struct ExtractOpts {
+    /// Keep the received archive as `<folder>.zip`, skip auto-extraction.
+    /// **Silently ignored** on a direct (`--sync`) transfer — there is no
+    /// archive, and scripts may pass it across both share kinds (spec §3).
+    pub no_extract: bool,
+    /// `--replace-delete`: overwrite same-name files AND delete destination
+    /// files the sender does not have. Applies to both folder modes; on a zip
+    /// share it runs after extraction.
+    pub replace_delete: bool,
+    /// `--yes`: bypass the empty-source fat-finger guard for the prune.
+    pub yes: bool,
+}
+
+impl ExtractOpts {
+    fn sync_options(&self) -> super::sync_flow::SyncOptions {
+        super::sync_flow::SyncOptions {
+            replace_delete: self.replace_delete,
+            confirm_all: self.yes,
+        }
+    }
+}
+
 pub async fn run(
     url_or_id: impl Into<String>,
     password: impl Into<String>,
     output_dir: Option<String>,
     server: Option<String>,
     relay_only: bool,
+    extract_opts: ExtractOpts,
     log: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let url_or_id = url_or_id.into();
@@ -75,20 +110,129 @@ pub async fn run(
 
     match parse_share_url(&url_or_id) {
         ParsedUrl::Server { id } => {
-            run_server(&id, &password, output_dir.as_deref(), server.as_deref(), log).await
+            run_server(&id, &password, output_dir.as_deref(), server.as_deref(), extract_opts, log).await
         }
         ParsedUrl::P2p { id } => {
-            run_p2p(&id, &password, output_dir.as_deref(), server.as_deref(), relay_only, log).await
+            run_p2p(&id, &password, output_dir.as_deref(), server.as_deref(), relay_only, extract_opts, false, log).await
+        }
+        // A /sync/ link routes to the same session flow, only with the
+        // expectation flipped — so a mismatch between the link and the sender's
+        // hello is reported instead of guessed at (spec §3a).
+        ParsedUrl::Sync { id } => {
+            run_p2p(&id, &password, output_dir.as_deref(), server.as_deref(), relay_only, extract_opts, true, log).await
         }
         ParsedUrl::BareId { id } => {
-            // Try server first; if not found, fall back to P2P
-            let result = run_server(&id, &password, output_dir.as_deref(), server.as_deref(), log).await;
+            // Try server first; if not found, fall back to P2P. A bare id never
+            // resolves to sync — sync links are always full URLs online.
+            let result = run_server(&id, &password, output_dir.as_deref(), server.as_deref(), extract_opts, log).await;
             if matches!(&result, Err(e) if e.to_string().contains("not found")) {
-                return run_p2p(&id, &password, output_dir.as_deref(), server.as_deref(), relay_only, log).await;
+                return run_p2p(&id, &password, output_dir.as_deref(), server.as_deref(), relay_only, extract_opts, false, log).await;
             }
             result
         }
     }
+}
+
+/// Save a received `file`-type payload to `dir`, auto-extracting folder shares.
+///
+/// A share is a *folder share* only when the sender marked it with
+/// `archive::FOLDER_MIME` in `FileMetadata.mimeType` — a plain user-sent `.zip`
+/// (CLI sends `application/octet-stream`, web sends the browser MIME) is saved
+/// as-is, never extracted. On successful extraction the archive is deleted; on
+/// a refused/failed extraction the archive is kept and named in the error.
+fn save_received_file(
+    decrypted: &[u8],
+    filename: &str,
+    mime_type: &str,
+    dir: &str,
+    opts: ExtractOpts,
+) -> Result<()> {
+    let filepath = super::deduplicate_path(PathBuf::from(dir).join(filename));
+    super::confirm_unsafe_file(filename)?;
+    std::fs::write(&filepath, decrypted)?;
+
+    let is_folder_share =
+        mime_type == crate::archive::FOLDER_MIME && filename.to_lowercase().ends_with(".zip");
+    if !is_folder_share || opts.no_extract {
+        super::log::step(&format!("Saved: {}", filepath.display()));
+        return Ok(());
+    }
+
+    // Destination keeps the sender's folder name: `<folder>.zip` → `./<folder>/`.
+    // A populated destination is merge-overwritten silently (task 058, spec §3).
+    let dest = PathBuf::from(dir).join(&filename[..filename.len() - ".zip".len()]);
+    match crate::archive::extract(&filepath, &dest) {
+        Ok(summary) => {
+            for link in &summary.skipped_symlinks {
+                super::display::warn(&format!("Skipping symlink in archive: {}", link.display()));
+            }
+            std::fs::remove_file(&filepath)?;
+            // `--replace-delete` also mirrors deletions on a zip share: after
+            // extraction, remove destination files the archive did not contain.
+            let deleted = if opts.replace_delete {
+                super::sync_flow::prune_extras(&dest, &summary.written)?
+            } else {
+                0
+            };
+            super::log::step(&format!(
+                "Extracted into {} — {} file(s) written, {deleted} deleted",
+                dest.display(),
+                summary.file_count,
+            ));
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "{e}\nThe received archive was kept at \"{}\" (extract it manually, or re-run with --no-extract to keep the zip).",
+            filepath.display()
+        )),
+    }
+}
+
+/// The metadata frame the sender sends for a direct folder sync (task 058).
+/// Detected by `contentType == "sync"`; the sync protocol's own hello frame
+/// inside the channel is what finally decides the mode (spec §3a).
+const SYNC_CONTENT_TYPE: &str = "sync";
+
+/// Sentinel error used to hand a live DataChannel over from the single-payload
+/// receive loop to the sync receiver: the metadata frame is only seen deep inside
+/// that loop, so it returns this marker and the caller takes over.
+const SYNC_HANDOVER: &str = "__nullseal_sync_handover__";
+
+/// Receiver half of the in-channel sync handshake, then the whole sync run.
+///
+/// `sender_meta` is the sender's stream metadata (from its `metadata` frame); we
+/// answer with our own so each direction has its own keyed stream.
+async fn receive_sync(
+    receiver: &mut crate::webrtc::ReceiverPeer,
+    password: &str,
+    output_dir: Option<&str>,
+    sender_meta: &crate::crypto::StreamEncryptionMetadata,
+    opts: ExtractOpts,
+) -> Result<()> {
+    use super::sync_flow::{ReceiverWire, Sealer, Unsealer};
+
+    if opts.no_extract {
+        // Meaningless rather than wrong: scripts may pass it unconditionally.
+        super::log::event("--no-extract ignored: a direct sync has no archive");
+    }
+    let dest = PathBuf::from(output_dir.unwrap_or("."));
+    let sealer = Sealer::new(password);
+    receiver
+        .send_frame(
+            serde_json::json!({
+                "type": "syncMeta",
+                "streamEncryptionMetadata": sealer.metadata(),
+            })
+            .to_string(),
+        )
+        .await?;
+
+    let mut wire =
+        ReceiverWire { peer: receiver, sealer, unsealer: Unsealer::new(sender_meta, password)? };
+    let summary = super::sync_flow::run_receiver(&mut wire, &dest, opts.sync_options()).await?;
+    super::log::blank();
+    super::display::status(&super::sync_flow::format_receiver_summary(&dest, &summary));
+    Ok(())
 }
 
 // ── Server mode ───────────────────────────────────────────────────────────────
@@ -98,6 +242,7 @@ async fn run_server(
     password: &str,
     output_dir: Option<&str>,
     server: Option<&str>,
+    extract_opts: ExtractOpts,
     log: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let client = ApiClient::new(server_url(server)?);
@@ -135,10 +280,7 @@ async fn run_server(
     if payload.content_type == "file" {
         if let Some(fm) = &payload.file_metadata {
             let dir = output_dir.unwrap_or(".");
-            let filepath = super::deduplicate_path(PathBuf::from(dir).join(&fm.filename));
-            confirm_unsafe_file(&fm.filename)?;
-            std::fs::write(&filepath, &decrypted)?;
-            super::log::step(&format!("Saved: {}", filepath.display()));
+            save_received_file(&decrypted, &fm.filename, &fm.mime_type, dir, extract_opts)?;
             return Ok(());
         }
     }
@@ -149,12 +291,17 @@ async fn run_server(
 
 // ── P2P mode ──────────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 async fn run_p2p(
     session_id: &str,
     password: &str,
     output_dir: Option<&str>,
     server: Option<&str>,
     relay_only: bool,
+    extract_opts: ExtractOpts,
+    // True when the link was a `/sync/<id>` one. Only used to report a
+    // link-vs-hello mismatch — the sender's declaration always wins.
+    expect_sync: bool,
     log: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let base = server_url(server)?;
@@ -229,6 +376,9 @@ async fn run_p2p(
     let mut plaintext_buf: Vec<u8> = Vec::new();
     let mut content_type = String::new();
     let mut file_meta: Option<serde_json::Value> = None;
+    // Set when the sender's metadata frame declares a folder sync — the
+    // single-payload loop then hands the live DataChannel to `receive_sync`.
+    let mut sync_meta: Option<crate::crypto::StreamEncryptionMetadata> = None;
 
     // Helper: reconnect socket if dead, then emit join
     macro_rules! rejoin {
@@ -406,6 +556,19 @@ async fn run_p2p(
                                     v["streamEncryptionMetadata"].clone()
                                 ).map_err(|e| anyhow::anyhow!("invalid stream metadata: {e}"))?;
 
+                                // Folder sync (task 058): the sender's declaration is
+                                // authoritative in every transport, so hand the live
+                                // channel to the sync receiver whatever the link said.
+                                if content_type == SYNC_CONTENT_TYPE {
+                                    sync_meta = Some(stream_meta);
+                                    return Err(anyhow::anyhow!(SYNC_HANDOVER));
+                                }
+                                if expect_sync {
+                                    super::display::warn(&format!(
+                                        "This /sync/ link points at a plain {content_type} transfer — following the sender."
+                                    ));
+                                }
+
                                 total_plaintext_size = stream_meta.total_plaintext_size as usize;
                                 let resume_from = v["resumeFromChunk"].as_u64().unwrap_or(0);
                                 super::log::event(&format!(
@@ -488,6 +651,27 @@ async fn run_p2p(
         // (is_alive) rejoin on the same control. (task 022)
         control.events.peer_disconnected = peer_disconnected;
 
+        // Folder sync (task 058): the metadata frame declared a direct multi-file
+        // transfer, so the single-payload loop bailed out with SYNC_HANDOVER and
+        // the sync receiver takes the live DataChannel from here.
+        if let Some(meta) = sync_meta.take() {
+            if !expect_sync {
+                super::display::warn(
+                    "The sender is doing a folder sync (this link is not a /sync/ one) — following the sender.",
+                );
+            }
+            let result = receive_sync(&mut receiver, password, output_dir, &meta, extract_opts).await;
+            // close_and_flush (awaited) so our final Done frame reaches the sender.
+            receiver.close_and_flush().await;
+            let _ = control.complete("recipient", &sha256_hex("sync"));
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                control.events.deleted.recv(),
+            )
+            .await;
+            return result;
+        }
+
         match transfer_result {
             Ok(checksum) => {
                 super::log::blank();
@@ -502,11 +686,9 @@ async fn run_p2p(
                         let filename = fm["filename"]
                             .as_str()
                             .unwrap_or("received_file");
+                        let mime = fm["mimeType"].as_str().unwrap_or("");
                         let dir = output_dir.unwrap_or(".");
-                        let filepath = super::deduplicate_path(PathBuf::from(dir).join(filename));
-                        confirm_unsafe_file(filename)?;
-                        std::fs::write(&filepath, &plaintext_buf)?;
-                        super::log::step(&format!("Saved: {}", filepath.display()));
+                        save_received_file(&plaintext_buf, filename, mime, dir, extract_opts)?;
                     } else {
                         log(std::str::from_utf8(&plaintext_buf).unwrap_or("(binary data)"));
                     }
@@ -545,6 +727,7 @@ pub async fn run_local(
     password: impl Into<String>,
     output_dir: Option<String>,
     ip: Option<String>,
+    extract_opts: ExtractOpts,
     log: &mut dyn FnMut(&str),
 ) -> Result<()> {
     let password = password.into();
@@ -623,6 +806,9 @@ pub async fn run_local(
     let mut plaintext_buf: Vec<u8> = Vec::new();
     let mut content_type = String::new();
     let mut file_meta: Option<serde_json::Value> = None;
+    // LAN mints no URL, so the sender's declaration is the ONLY mode signal here
+    // (spec §3a) — `get --local` adapts with no extra flag.
+    let mut sync_meta: Option<crate::crypto::StreamEncryptionMetadata> = None;
 
     macro_rules! rejoin {
         () => {{
@@ -741,6 +927,12 @@ pub async fn run_local(
                             v["streamEncryptionMetadata"].clone()
                         ).map_err(|e| anyhow::anyhow!("invalid stream metadata: {e}"))?;
 
+                        // Folder sync over the LAN (task 058) — hand over below.
+                        if content_type == SYNC_CONTENT_TYPE {
+                            sync_meta = Some(stream_meta);
+                            return Err(anyhow::anyhow!(SYNC_HANDOVER));
+                        }
+
                         total_plaintext_size = stream_meta.total_plaintext_size as usize;
                         let resume_from = v["resumeFromChunk"].as_u64().unwrap_or(0);
                         super::log::event(&format!(
@@ -817,6 +1009,22 @@ pub async fn run_local(
         // Restore the peer_disconnected receiver (see run_p2p). (task 022)
         control.events.peer_disconnected = peer_disconnected;
 
+        // Folder sync over the LAN (task 058): the hello/metadata declared a
+        // direct multi-file transfer, so the sync receiver takes over.
+        if let Some(meta) = sync_meta.take() {
+            let result =
+                receive_sync(&mut receiver, &password, output_dir.as_deref(), &meta, extract_opts)
+                    .await;
+            receiver.close_and_flush().await;
+            let _ = control.complete("recipient", &sha256_hex("sync"));
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                control.events.deleted.recv(),
+            )
+            .await;
+            return result;
+        }
+
         match transfer_result {
             Ok(checksum) => {
                 receiver.close();
@@ -844,11 +1052,9 @@ pub async fn run_local(
     if content_type == "file" {
         if let Some(fm) = &file_meta {
             let filename = fm["filename"].as_str().unwrap_or("received_file");
+            let mime = fm["mimeType"].as_str().unwrap_or("");
             let dir = output_dir.as_deref().unwrap_or(".");
-            let filepath = super::deduplicate_path(PathBuf::from(dir).join(filename));
-            confirm_unsafe_file(filename)?;
-            std::fs::write(&filepath, &plaintext_buf)?;
-            super::log::step(&format!("Saved: {}", filepath.display()));
+            save_received_file(&plaintext_buf, filename, mime, dir, extract_opts)?;
         } else {
             log(std::str::from_utf8(&plaintext_buf).unwrap_or("(binary data)"));
         }
@@ -920,6 +1126,46 @@ mod tests {
             parse_share_url("s/abc789"),
             ParsedUrl::Server { id: "abc789".into() }
         );
+    }
+
+    // ── /sync prefix routing (task 058) ──────────────────────────────────
+
+    #[test]
+    fn parses_sync_url_and_prefix() {
+        assert_eq!(
+            parse_share_url("https://nullseal.com/sync/sess789"),
+            ParsedUrl::Sync { id: "sess789".into() }
+        );
+        assert_eq!(
+            parse_share_url("http://localhost:3000/sync/local9"),
+            ParsedUrl::Sync { id: "local9".into() }
+        );
+        assert_eq!(parse_share_url("sync/bare9"), ParsedUrl::Sync { id: "bare9".into() });
+    }
+
+    #[test]
+    fn empty_sync_prefix_is_bare_id() {
+        assert_eq!(parse_share_url("sync/"), ParsedUrl::BareId { id: "sync/".into() });
+    }
+
+    #[test]
+    fn a_bare_id_never_resolves_to_sync() {
+        // Sync links are always full URLs online; BareId keeps its server→p2p
+        // fallback only.
+        assert_eq!(parse_share_url("syncabc"), ParsedUrl::BareId { id: "syncabc".into() });
+        assert_eq!(
+            parse_share_url("https://nullseal.com/other/sync"),
+            ParsedUrl::BareId { id: "https://nullseal.com/other/sync".into() }
+        );
+    }
+
+    #[test]
+    fn extract_opts_map_onto_the_sync_options() {
+        let opts = ExtractOpts { no_extract: true, replace_delete: true, yes: true };
+        let sync = opts.sync_options();
+        assert!(sync.replace_delete && sync.confirm_all);
+        let off = ExtractOpts::default().sync_options();
+        assert!(!off.replace_delete && !off.confirm_all);
     }
 
     // ── server get ───────────────────────────────────────────────────────────
@@ -1018,7 +1264,7 @@ mod tests {
         mount_text_share(&server, "abc123", b"top secret", "mypassword").await;
 
         let mut logged = String::new();
-        run("https://example.com/s/abc123", "mypassword", None, Some(url), false, &mut |s| {
+        run("https://example.com/s/abc123", "mypassword", None, Some(url), false, ExtractOpts::default(), &mut |s| {
             logged = s.to_owned()
         })
         .await
@@ -1033,7 +1279,7 @@ mod tests {
         // Encrypt challenge with "correctpass" — client will try "wrongpass" and fail locally
         mount_text_share(&server, "abc", b"secret", "correctpass").await;
 
-        let err = run("https://example.com/s/abc", "wrongpass", None, Some(url), false, &mut |_| {})
+        let err = run("https://example.com/s/abc", "wrongpass", None, Some(url), false, ExtractOpts::default(), &mut |_| {})
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -1053,7 +1299,7 @@ mod tests {
         mount_file_share(&server, "fid", content, password, "data.zip").await;
 
         let dir = tmp.path().to_str().unwrap().to_owned();
-        run("https://example.com/s/fid", password, Some(dir.clone()), Some(url), false, &mut |_| {})
+        run("https://example.com/s/fid", password, Some(dir.clone()), Some(url), false, ExtractOpts::default(), &mut |_| {})
             .await
             .unwrap();
 
@@ -1072,7 +1318,7 @@ mod tests {
         mount_file_share(&server, "dup", content, password, "data.zip").await;
 
         let dir = tmp.path().to_str().unwrap().to_owned();
-        run("https://example.com/s/dup", password, Some(dir.clone()), Some(url), false, &mut |_| {})
+        run("https://example.com/s/dup", password, Some(dir.clone()), Some(url), false, ExtractOpts::default(), &mut |_| {})
             .await
             .unwrap();
 
@@ -1082,6 +1328,179 @@ mod tests {
         let deduped = tmp.path().join("data (1).zip");
         assert!(deduped.exists(), "expected deduplicated file at {:?}", deduped);
         assert_eq!(std::fs::read(&deduped).unwrap(), content);
+    }
+
+    // ── folder shares (task 051) ─────────────────────────────────────────
+
+    /// Like `mount_file_share`, but the fileMetadata carries the folder-share
+    /// marker MIME so the recipient auto-extracts.
+    async fn mount_folder_share(server: &MockServer, share_id: &str, content: &[u8], password: &str, filename: &str) {
+        let r = encrypt_bytes(content, password);
+        let challenge = generate_challenge(password);
+        let verify_id = "v".repeat(32);
+        let checksum = sha256_bytes(content);
+
+        Mock::given(method("GET"))
+            .and(path(format!("/shares/{share_id}/metadata")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "shareId": share_id,
+                "contentType": "file",
+                "oneTimeRead": false,
+                "encryptedChallenge": challenge.encrypted_challenge,
+                "challengeMetadata": {
+                    "salt": challenge.challenge_metadata.salt,
+                    "iv": challenge.challenge_metadata.iv,
+                    "iterations": challenge.challenge_metadata.iterations
+                },
+                "verifyId": verify_id,
+                "contentChecksum": checksum
+            })))
+            .mount(server)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path(format!("/shares/{share_id}/payload")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "contentType": "file",
+                "encryptedPayload": r.encrypted_payload,
+                "encryptionMetadata": {
+                    "algorithm": r.encryption_metadata.algorithm,
+                    "kdf": r.encryption_metadata.kdf,
+                    "iterations": r.encryption_metadata.iterations,
+                    "salt": r.encryption_metadata.salt,
+                    "iv": r.encryption_metadata.iv
+                },
+                "fileMetadata": { "filename": filename, "mimeType": crate::archive::FOLDER_MIME, "size": content.len(), "extension": ".zip" },
+                "contentChecksum": checksum
+            })))
+            .mount(server)
+            .await;
+    }
+
+    /// Pack a small fixture tree ("proj": readme.txt + src/main.txt) and return
+    /// the zip bytes, exactly as the sender CLI would produce them.
+    fn packed_folder_bytes(work: &Path) -> Vec<u8> {
+        let folder = work.join("proj");
+        std::fs::create_dir_all(folder.join("src")).unwrap();
+        std::fs::write(folder.join("readme.txt"), b"read me").unwrap();
+        std::fs::write(folder.join("src/main.txt"), b"fn main").unwrap();
+        let zip_path = work.join("fixture.zip");
+        crate::archive::pack(&folder, &zip_path).unwrap();
+        let bytes = std::fs::read(&zip_path).unwrap();
+        std::fs::remove_file(&zip_path).unwrap();
+        bytes
+    }
+
+    #[tokio::test]
+    async fn folder_share_auto_extracts_and_deletes_archive() {
+        let work = tempfile::tempdir().unwrap();
+        let zip_bytes = packed_folder_bytes(work.path());
+        let out = tempfile::tempdir().unwrap();
+
+        let (server, url) = mock_server().await;
+        mount_folder_share(&server, "fs1", &zip_bytes, "folderpass", "proj.zip").await;
+
+        let dir = out.path().to_str().unwrap().to_owned();
+        run("https://example.com/s/fs1", "folderpass", Some(dir), Some(url), false, ExtractOpts::default(), &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(out.path().join("proj/readme.txt")).unwrap(), b"read me");
+        assert_eq!(std::fs::read(out.path().join("proj/src/main.txt")).unwrap(), b"fn main");
+        assert!(!out.path().join("proj.zip").exists(), "archive must be deleted after extraction");
+    }
+
+    #[tokio::test]
+    async fn plain_zip_share_is_not_auto_extracted() {
+        // A user-sent .zip (mimeType application/octet-stream — no folder marker)
+        // must be saved as-is, never extracted.
+        let work = tempfile::tempdir().unwrap();
+        let zip_bytes = packed_folder_bytes(work.path());
+        let out = tempfile::tempdir().unwrap();
+
+        let (server, url) = mock_server().await;
+        mount_file_share(&server, "pz1", &zip_bytes, "zippass", "proj.zip").await;
+
+        let dir = out.path().to_str().unwrap().to_owned();
+        run("https://example.com/s/pz1", "zippass", Some(dir), Some(url), false, ExtractOpts::default(), &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(out.path().join("proj.zip")).unwrap(), zip_bytes);
+        assert!(!out.path().join("proj").exists(), "plain zips must not be auto-extracted");
+    }
+
+    #[tokio::test]
+    async fn folder_share_no_extract_keeps_the_zip() {
+        let work = tempfile::tempdir().unwrap();
+        let zip_bytes = packed_folder_bytes(work.path());
+        let out = tempfile::tempdir().unwrap();
+
+        let (server, url) = mock_server().await;
+        mount_folder_share(&server, "fs2", &zip_bytes, "folderpass", "proj.zip").await;
+
+        let dir = out.path().to_str().unwrap().to_owned();
+        let opts = ExtractOpts { no_extract: true, ..Default::default() };
+        run("https://example.com/s/fs2", "folderpass", Some(dir), Some(url), false, opts, &mut |_| {})
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read(out.path().join("proj.zip")).unwrap(), zip_bytes);
+        assert!(!out.path().join("proj").exists(), "--no-extract must skip extraction");
+    }
+
+    #[tokio::test]
+    async fn folder_share_merges_into_an_existing_destination_silently() {
+        // Task 058 reversal: the old refusal (and `--force`) are gone — a
+        // populated destination is merge-overwritten with no complaint.
+        let work = tempfile::tempdir().unwrap();
+        let zip_bytes = packed_folder_bytes(work.path());
+        let out = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(out.path().join("proj")).unwrap();
+        std::fs::write(out.path().join("proj/readme.txt"), b"old local").unwrap();
+        std::fs::write(out.path().join("proj/mine.txt"), b"mine").unwrap();
+
+        let (server, url) = mock_server().await;
+        mount_folder_share(&server, "fs3", &zip_bytes, "folderpass", "proj.zip").await;
+
+        let dir = out.path().to_str().unwrap().to_owned();
+        run("https://example.com/s/fs3", "folderpass", Some(dir), Some(url), false, ExtractOpts::default(), &mut |_| {})
+            .await
+            .unwrap();
+
+        // Colliding file overwritten, non-colliding kept, new files added, zip gone.
+        assert_eq!(std::fs::read(out.path().join("proj/readme.txt")).unwrap(), b"read me");
+        assert_eq!(std::fs::read(out.path().join("proj/mine.txt")).unwrap(), b"mine");
+        assert_eq!(std::fs::read(out.path().join("proj/src/main.txt")).unwrap(), b"fn main");
+        assert!(!out.path().join("proj.zip").exists());
+    }
+
+    #[tokio::test]
+    async fn folder_share_replace_delete_prunes_files_absent_from_the_archive() {
+        // `--replace-delete` also mirrors deletions on a ZIP share, after extraction.
+        let work = tempfile::tempdir().unwrap();
+        let zip_bytes = packed_folder_bytes(work.path());
+        let out = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(out.path().join("proj/old")).unwrap();
+        std::fs::write(out.path().join("proj/readme.txt"), b"old local").unwrap();
+        std::fs::write(out.path().join("proj/stale.txt"), b"gone soon").unwrap();
+        std::fs::write(out.path().join("proj/old/deep.txt"), b"gone too").unwrap();
+
+        let (server, url) = mock_server().await;
+        mount_folder_share(&server, "fs4", &zip_bytes, "folderpass", "proj.zip").await;
+
+        let dir = out.path().to_str().unwrap().to_owned();
+        let opts = ExtractOpts { no_extract: false, replace_delete: true, yes: false };
+        run("https://example.com/s/fs4", "folderpass", Some(dir), Some(url), false, opts, &mut |_| {})
+            .await
+            .unwrap();
+
+        // The archive's files are there…
+        assert_eq!(std::fs::read(out.path().join("proj/readme.txt")).unwrap(), b"read me");
+        assert_eq!(std::fs::read(out.path().join("proj/src/main.txt")).unwrap(), b"fn main");
+        // …and everything the archive did NOT contain is gone.
+        assert!(!out.path().join("proj/stale.txt").exists());
+        assert!(!out.path().join("proj/old/deep.txt").exists());
     }
 
     #[tokio::test]
@@ -1094,7 +1513,7 @@ mod tests {
         mount_file_share(&server, "file1", content, password, "doc.zip").await;
 
         let dir = tmp.path().to_str().unwrap().to_owned();
-        run("https://example.com/s/file1", password, Some(dir.clone()), Some(url), false, &mut |_| {})
+        run("https://example.com/s/file1", password, Some(dir.clone()), Some(url), false, ExtractOpts::default(), &mut |_| {})
             .await
             .unwrap();
 
@@ -1113,7 +1532,7 @@ mod tests {
 
         // Use full URL so it's parsed as explicit server mode (no P2P fallback)
         let share_url = format!("{}/s/gone", url);
-        let err = run(share_url, "password", None, Some(url), false, &mut |_| {})
+        let err = run(share_url, "password", None, Some(url), false, ExtractOpts::default(), &mut |_| {})
             .await
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("not found") || err.to_string().to_lowercase().contains("unavailable"));
@@ -1121,7 +1540,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_short_password() {
-        let err = run("abc123", "ab", None, None, false, &mut |_| {}).await.unwrap_err();
+        let err = run("abc123", "ab", None, None, false, ExtractOpts::default(), &mut |_| {}).await.unwrap_err();
         assert!(err.to_string().contains("Password"));
     }
 
@@ -1138,7 +1557,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run("https://nullseal.com/p2p/s1", "password", None, Some(url), false, &mut |_| {})
+        let err = run("https://nullseal.com/p2p/s1", "password", None, Some(url), false, ExtractOpts::default(), &mut |_| {})
             .await
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("expired"));
@@ -1157,7 +1576,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run("https://nullseal.com/p2p/sfin", "password", None, Some(url), false, &mut |_| {})
+        let err = run("https://nullseal.com/p2p/sfin", "password", None, Some(url), false, ExtractOpts::default(), &mut |_| {})
             .await
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("no longer available"));
@@ -1181,7 +1600,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let err = run("https://nullseal.com/p2p/s2", "password", None, Some(url), false, &mut |_| {})
+        let err = run("https://nullseal.com/p2p/s2", "password", None, Some(url), false, ExtractOpts::default(), &mut |_| {})
             .await
             .unwrap_err();
         assert!(err.to_string().to_lowercase().contains("wrong password"));
@@ -1252,7 +1671,7 @@ mod tests {
         mount_file_share(&server, "fid2", content, password, "test.pdf").await;
 
         let dir = tmp.path().to_str().unwrap().to_owned();
-        run("s/fid2", password, Some(dir.clone()), Some(url), false, &mut |_| {})
+        run("s/fid2", password, Some(dir.clone()), Some(url), false, ExtractOpts::default(), &mut |_| {})
             .await
             .unwrap();
 

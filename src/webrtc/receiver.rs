@@ -90,7 +90,35 @@ impl ReceiverPeer {
         self.event_rx.recv().await
     }
 
+    /// Send a text frame back to the sender (the sync handshake's `syncMeta`).
+    pub async fn send_frame(&self, frame: String) -> Result<()> {
+        self.cmd_tx
+            .send(LoopCmd::SendData(frame))
+            .await
+            .map_err(|_| anyhow::anyhow!("event loop closed"))
+    }
+
+    /// Send a binary frame back to the sender over the same DataChannel.
+    ///
+    /// The v2 single-payload flow is one-directional (its ACKs ride the
+    /// signaling channel), but the direct multi-file transfer (task 058) needs a
+    /// real answer channel — manifest acks, per-file ok/fail. The event loop
+    /// captures the incoming channel's id on `ChannelOpen`, so writing back needs
+    /// no extra setup.
+    pub async fn send_binary(&self, data: Vec<u8>) -> Result<()> {
+        self.cmd_tx
+            .send(LoopCmd::SendBinary(data))
+            .await
+            .map_err(|_| anyhow::anyhow!("event loop closed"))
+    }
+
     pub fn close(&self) {
         let _ = self.cmd_tx.try_send(LoopCmd::Close);
+    }
+
+    /// Close and wait for the event loop to drain (mirrors `SenderPeer`), so the
+    /// last frames we wrote actually reach the wire before the process exits.
+    pub async fn close_and_flush(&self) {
+        let _ = self.cmd_tx.send(LoopCmd::Close).await;
     }
 }
