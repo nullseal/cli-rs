@@ -441,6 +441,10 @@ struct PartFile {
     hasher: Hasher,
     mode: u32,
     existed: bool,
+    /// Declared size, and bytes in so far — the live `Receiving:` counter, which
+    /// is the only thing on screen during a multi-hundred-MB file.
+    declared: u64,
+    received: u64,
 }
 
 /// Drive one whole receive into `dest_root`. Files are written to
@@ -475,6 +479,7 @@ pub async fn run_receiver<W: Wire>(
     let mut summary = SyncSummary::default();
     let mut current: Option<PartFile> = None;
     let mut acked = false;
+    let mut files_started = 0u64;
 
     let result: Result<()> = async {
         loop {
@@ -523,8 +528,12 @@ pub async fn run_receiver<W: Wire>(
                     let part = with_part_suffix(&target);
                     let file = File::create(&part)
                         .with_context(|| format!("cannot write \"{}\"", part.display()))?;
+                    if files_started == 0 {
+                        super::log::step("Receiving files…");
+                    }
+                    files_started += 1;
                     super::log::event(&format!(
-                        "receiving {path} ({})",
+                        "receiving {path} ({}) [#{files_started}]",
                         super::format_size(size as usize)
                     ));
                     current = Some(PartFile {
@@ -535,6 +544,8 @@ pub async fn run_receiver<W: Wire>(
                         file,
                         hasher: Hasher::new(),
                         mode,
+                        declared: size,
+                        received: 0,
                     });
                 }
                 Frame::Chunk(bytes) => {
@@ -547,6 +558,13 @@ pub async fn run_receiver<W: Wire>(
                         .write_all(&bytes)
                         .with_context(|| format!("cannot write \"{}\"", part.part.display()))?;
                     part.hasher.update(&bytes);
+                    // Inline overwrite on a TTY, one line per finished file when
+                    // piped — never per chunk (see `log::progress`).
+                    part.received += bytes.len() as u64;
+                    super::display::receive_progress(
+                        part.received as usize,
+                        part.declared.max(part.received) as usize,
+                    );
                 }
                 Frame::Control(ControlFrame::FileEnd { hash }) => {
                     let Some(part) = current.take() else {
@@ -561,9 +579,15 @@ pub async fn run_receiver<W: Wire>(
                             if existed {
                                 summary.overwritten += 1;
                             }
+                            super::log::event(&format!(
+                                "{rel} verified ({}) and moved into place{}",
+                                super::format_size(bytes as usize),
+                                if existed { ", replacing the previous copy" } else { "" },
+                            ));
                             wire.send(&Frame::Control(ControlFrame::FileOk { path: rel })).await?;
                         }
                         Err((rel, reason)) => {
+                            super::log::event(&format!("{rel} rejected: {reason}"));
                             wire.send(&Frame::Control(ControlFrame::FileFail {
                                 path: rel,
                                 reason,
@@ -573,8 +597,13 @@ pub async fn run_receiver<W: Wire>(
                     }
                 }
                 Frame::Control(ControlFrame::Delete { paths }) => {
+                    super::log::event(&format!(
+                        "sender announced {} stale path(s)",
+                        paths.len()
+                    ));
                     match engine.delete_decision(&paths) {
                         Ok(DeleteDecision::Prune(list)) => {
+                            super::log::step(&format!("Pruning {} stale file(s)…", list.len()));
                             summary.deleted = prune(dest_root, &list)? as u64;
                         }
                         Ok(DeleteDecision::Keep { count, reason }) => {
@@ -596,6 +625,7 @@ pub async fn run_receiver<W: Wire>(
                     }
                 }
                 Frame::Control(ControlFrame::Done { skipped, .. }) => {
+                    super::log::event("sender's done frame received; sending our summary");
                     summary.skipped = skipped;
                     wire.send(&Frame::Control(ControlFrame::Done {
                         files_sent: summary.files_sent,
@@ -630,12 +660,34 @@ pub async fn run_receiver<W: Wire>(
 
 /// Verify a finished part file and atomically move it into place.
 /// `Err((rel, reason))` means the file was discarded and a `FileFail` is due.
+///
+/// **`received != declared` is deliberately not an error.** The declared size comes
+/// from `FileBegin`, i.e. from the manifest scan; the sender recomputes the hash
+/// *while streaming* precisely because the file may have changed since it was
+/// walked (see `send_one_file`). The `FileEnd` hash therefore describes what
+/// actually travelled, and checking it is strictly stronger than any length
+/// comparison — a truncated transfer fails the hash. Rejecting on a size
+/// difference would instead turn that documented, benign race into a spurious
+/// failure. The mismatch is worth *saying* at `--verbose`, which is what it is
+/// used for below.
+///
+/// Fields are bound explicitly rather than with `..` on purpose: a future field
+/// added to `PartFile` must break this destructure and be decided about here.
 fn commit_part(
     engine: &ReceiverEngine,
     part: PartFile,
     expected_hash: &str,
 ) -> std::result::Result<(String, u64, bool), (String, String)> {
-    let PartFile { rel, part: part_path, target, file, hasher, mode, existed } = part;
+    let PartFile { rel, part: part_path, target, file, hasher, mode, existed, declared, received } =
+        part;
+    if received != declared {
+        super::log::event(&format!(
+            "{rel}: {} arrived but the manifest declared {} — the source changed while it was \
+             being read; the FileEnd hash decides",
+            super::format_size(received as usize),
+            super::format_size(declared as usize),
+        ));
+    }
     let bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
     if let Err(e) = file.sync_all() {
         let _ = fs::remove_file(&part_path);
@@ -1120,6 +1172,58 @@ mod tests {
         .unwrap();
         let summary = recv.await.unwrap().unwrap();
         assert_eq!(summary.files_sent, 0);
+    }
+
+    #[tokio::test]
+    async fn a_file_that_shrank_since_the_scan_is_committed_on_its_hash_not_its_declared_size() {
+        // The sender declares the size it saw when it walked the tree, but hashes
+        // what it actually streams. A file edited in between therefore arrives
+        // with a size that disagrees with the manifest — and that must NOT be an
+        // error, or every log/db file under active write would fail the sync.
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("dst");
+        let (mut a, mut b) = loopback_pair();
+        let dst2 = dst.clone();
+        let recv =
+            tokio::spawn(async move { run_receiver(&mut b, &dst2, SyncOptions::default()).await });
+
+        a.send(&Frame::Control(hello_frame(TransferMode::Sync))).await.unwrap();
+        a.send(&Frame::Control(ControlFrame::Manifest { files: vec![], more: false }))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            a.recv().await.unwrap(); // the receiver's hello + ack
+        }
+        // Declared 9_000 bytes, three actually sent — with the hash of the three.
+        a.send(&Frame::Control(ControlFrame::FileBegin {
+            path: "shrank.log".into(),
+            size: 9_000,
+            mode: 0o644,
+        }))
+        .await
+        .unwrap();
+        a.send(&Frame::Chunk(b"abc".to_vec())).await.unwrap();
+        a.send(&Frame::Control(ControlFrame::FileEnd {
+            hash: crate::transfer::engine::sha256_hex_bytes(b"abc"),
+        }))
+        .await
+        .unwrap();
+
+        match a.recv().await.unwrap() {
+            Frame::Control(ControlFrame::FileOk { path }) => assert_eq!(path, "shrank.log"),
+            other => panic!("a short-but-correctly-hashed file must commit, got {other:?}"),
+        }
+        assert_eq!(fs::read(dst.join("shrank.log")).unwrap(), b"abc");
+
+        a.send(&Frame::Control(ControlFrame::Done {
+            files_sent: 1,
+            bytes: 3,
+            deleted: 0,
+            skipped: 0,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(recv.await.unwrap().unwrap().files_sent, 1);
     }
 
     #[tokio::test]

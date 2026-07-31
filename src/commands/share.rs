@@ -1030,8 +1030,11 @@ async fn run_sync_local(
     super::log::event(&format!(
         "sync data listener on {local_ip}:{data_port} (TCP — no ICE, no UDP)"
     ));
+    super::log::event("data port announced to the recipient over signaling");
+    super::log::step("Opening the data connection…");
 
     let mut wire = super::sync_tcp::accept_data(listener, password).await?;
+    super::log::step(&format!("Connected to {} — starting the file comparison.", wire.peer_addr()));
     super::log::event(&format!("sync data connection from {} (TCP)", wire.peer_addr()));
 
     let summary = super::sync_flow::run_sender(

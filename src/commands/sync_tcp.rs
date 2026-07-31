@@ -371,12 +371,17 @@ async fn accept_data_within(
     // and nothing sealed was ever emitted on one, so the sealer stays valid.
     let sealer = Sealer::new(password);
     let our_meta = sealer.metadata();
+    super::log::event(&format!(
+        "waiting up to {}s for the recipient's data connection on port {port}",
+        budget.as_secs()
+    ));
     let accepting = async {
         loop {
             let (stream, from) = listener
                 .accept()
                 .await
                 .context("cannot accept on the sync data port")?;
+            super::log::event(&format!("data connection accepted from {from}; exchanging keys"));
             match handshake(stream, &our_meta).await {
                 Ok(handshaken) => return Ok::<Handshaken, anyhow::Error>(handshaken),
                 Err(e) => {
@@ -406,11 +411,13 @@ pub async fn connect_data(addr: &str, password: &str) -> Result<TcpWire> {
 }
 
 async fn connect_data_within(addr: &str, password: &str, budget: Duration) -> Result<TcpWire> {
+    super::log::event(&format!("opening a TCP data connection to {addr}"));
     let stream = match tokio::time::timeout(budget, TcpStream::connect(addr)).await {
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => bail!(connect_error(addr, &e.to_string())),
         Err(_) => bail!(connect_timeout_error(addr, budget.as_secs())),
     };
+    super::log::event("data connection open; exchanging keys");
     let sealer = Sealer::new(password);
     let handshaken = match tokio::time::timeout(budget, handshake(stream, &sealer.metadata())).await
     {
