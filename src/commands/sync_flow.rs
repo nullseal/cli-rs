@@ -1,0 +1,1617 @@
+//! I/O half of the direct multi-file transfer (task 058): walk + hash the
+//! source, stream files through a [`Wire`], write them atomically on the far
+//! side, and prune what `--replace-delete` allows.
+//!
+//! Every protocol decision lives in the pure `crate::transfer` module — this
+//! file only turns those decisions into filesystem and DataChannel calls. The
+//! split is the same one the P2P v2 engines/adapters use.
+//!
+//! Frames ride the existing encrypted DataChannel as opaque payload: each frame
+//! is length-prefixed by `transfer::protocol`, then sealed with the session's
+//! `StreamCipher` (one keyed stream per direction, so nonces never repeat).
+
+use std::collections::BTreeSet;
+use std::fs::{self, File};
+use std::io::{BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+
+use anyhow::{bail, Context, Result};
+
+use crate::crypto::{StreamCipher, StreamDecryptor, StreamEncryptionMetadata};
+use crate::transfer::engine::{
+    hello_frame, sync_root, validate_path_component, DeleteDecision, Hasher, KeepReason,
+    ReceiverEngine, SenderEngine,
+};
+use crate::transfer::protocol::{
+    decode_message, encode_frame, ControlFrame, FileEntry, Frame, PathHash, TransferError,
+    TransferMode, PROTO_VERSION,
+};
+
+/// Suffix of the temp file a received file occupies until its hash verifies.
+/// An interrupted run therefore never leaves a truncated file under a real name.
+pub const PART_SUFFIX: &str = ".nullseal-part";
+
+/// Receiver-side flags.
+#[derive(Clone, Copy, Default, Debug)]
+pub struct SyncOptions {
+    /// `--replace-delete`: prune destination files absent from the source.
+    pub replace_delete: bool,
+    /// `--yes`: bypass the empty-source fat-finger guard.
+    pub confirm_all: bool,
+}
+
+/// What a finished run did — printed by both sides.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SyncSummary {
+    pub files_sent: u64,
+    pub bytes: u64,
+    pub skipped: u64,
+    pub deleted: u64,
+    /// Stale destination files left in place (no `--replace-delete`, or the
+    /// fat-finger guard fired).
+    pub kept: u64,
+    /// Files whose write replaced an existing file (receiver side only).
+    pub overwritten: u64,
+}
+
+// ── Wire ──────────────────────────────────────────────────────────────────────
+
+/// A bidirectional frame channel. Implemented over the real DataChannel peers
+/// and over an in-memory pair in tests.
+pub trait Wire {
+    fn send(&mut self, frame: &Frame) -> impl std::future::Future<Output = Result<()>>;
+    /// Next frame from the peer; `Err` when the channel closed or the peer sent
+    /// something unparseable.
+    fn recv(&mut self) -> impl std::future::Future<Output = Result<Frame>>;
+}
+
+/// Per-direction frame sealing: `[frame index u64 BE][AES-GCM ciphertext]`.
+///
+/// The index is explicit on the wire so decryption never depends on both sides
+/// having counted the same number of messages.
+pub struct Sealer {
+    cipher: StreamCipher,
+    index: u64,
+}
+
+impl Sealer {
+    pub fn new(password: &str) -> Self {
+        // total_plaintext_size is only used for the metadata's chunk bookkeeping,
+        // which the sync path does not use — the nonce derivation is what matters.
+        Self { cipher: StreamCipher::new(password, 0), index: 0 }
+    }
+    pub fn metadata(&self) -> StreamEncryptionMetadata {
+        self.cipher.metadata()
+    }
+    pub fn seal(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        self.cipher.skip_to(self.index);
+        let ct = self
+            .cipher
+            .encrypt_chunk(plaintext)
+            .map_err(|e| anyhow::anyhow!("failed to encrypt a transfer frame: {e}"))?;
+        let mut out = Vec::with_capacity(8 + ct.len());
+        out.extend_from_slice(&self.index.to_be_bytes());
+        out.extend_from_slice(&ct);
+        self.index += 1;
+        Ok(out)
+    }
+}
+
+/// The peer's [`Sealer`] counterpart.
+pub struct Unsealer(StreamDecryptor);
+
+impl Unsealer {
+    pub fn new(meta: &StreamEncryptionMetadata, password: &str) -> Result<Self> {
+        Ok(Self(
+            StreamDecryptor::from_metadata(meta, password)
+                .map_err(|e| anyhow::anyhow!("failed to init the transfer decryptor: {e}"))?,
+        ))
+    }
+    pub fn unseal(&mut self, msg: &[u8]) -> Result<Vec<u8>> {
+        if msg.len() < 8 {
+            bail!("sealed transfer frame is truncated");
+        }
+        let mut idx = [0u8; 8];
+        idx.copy_from_slice(&msg[..8]);
+        let index = u64::from_be_bytes(idx);
+        self.0
+            .decrypt_chunk_at(&msg[8..], index)
+            .map_err(|e| anyhow::anyhow!("cannot decrypt transfer frame {index}: {e}"))
+    }
+}
+
+// ── source / destination scanning ─────────────────────────────────────────────
+
+/// Walk + hash the shared folder. `patterns` is the fully-resolved exclude list
+/// (`--exclude-from` files then `--exclude`, see `share::resolve_exclude_patterns`);
+/// `.nullsealignore` at the folder root is applied by the walker itself.
+///
+/// Directories are not manifest entries — the receiver creates parents as needed.
+/// Symlinks are skipped and returned so the caller can warn (as 051).
+pub fn scan_source(dir: &Path, patterns: &[String]) -> Result<(Vec<FileEntry>, Vec<String>)> {
+    let walk = crate::walker::walk(dir, patterns)?;
+    let mut files = Vec::new();
+    for entry in walk.entries.iter().filter(|e| !e.is_dir) {
+        let path = dir.join(&entry.rel_path);
+        let hash = hash_file(&path)?;
+        files.push(FileEntry {
+            path: entry.rel_path.clone(),
+            size: entry.size,
+            mode: entry.mode,
+            hash,
+        });
+    }
+    Ok((files, walk.skipped_symlinks))
+}
+
+/// Hash every file already in the destination tree.
+///
+/// Deliberately does **not** apply ignore rules: a mirror must see everything
+/// that is really there, otherwise a `.nullsealignore` copied into the
+/// destination would hide files and make them re-transfer on every run. Stale
+/// `.nullseal-part` files and symlinks are ignored.
+pub fn scan_dest(root: &Path) -> Result<Vec<PathHash>> {
+    let mut out = Vec::new();
+    if root.is_dir() {
+        collect_dest(root, "", &mut out)?;
+    }
+    out.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(out)
+}
+
+fn collect_dest(dir: &Path, prefix: &str, out: &mut Vec<PathHash>) -> Result<()> {
+    let mut entries: Vec<_> = fs::read_dir(dir)
+        .with_context(|| format!("cannot read directory \"{}\"", dir.display()))?
+        .collect::<std::io::Result<Vec<_>>>()
+        .with_context(|| format!("cannot read directory \"{}\"", dir.display()))?;
+    entries.sort_by_key(|e| e.file_name());
+    for entry in entries {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let rel = if prefix.is_empty() { name.clone() } else { format!("{prefix}/{name}") };
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)
+            .with_context(|| format!("cannot stat \"{}\"", path.display()))?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            collect_dest(&path, &rel, out)?;
+        } else if !name.ends_with(PART_SUFFIX) {
+            out.push(PathHash { path: rel, hash: hash_file(&path)? });
+        }
+    }
+    Ok(())
+}
+
+fn hash_file(path: &Path) -> Result<String> {
+    let mut f = BufReader::new(
+        File::open(path).with_context(|| format!("cannot read \"{}\"", path.display()))?,
+    );
+    let mut hasher = Hasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .with_context(|| format!("cannot read \"{}\"", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hasher.finish())
+}
+
+/// Remove leftover `*.nullseal-part` files from an interrupted run.
+pub fn discard_stale_parts(root: &Path) -> Result<usize> {
+    let mut removed = 0;
+    if root.is_dir() {
+        discard_parts_in(root, &mut removed)?;
+    }
+    Ok(removed)
+}
+
+fn discard_parts_in(dir: &Path, removed: &mut usize) -> Result<()> {
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("cannot read directory \"{}\"", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
+            discard_parts_in(&path, removed)?;
+        } else if entry.file_name().to_string_lossy().ends_with(PART_SUFFIX) {
+            fs::remove_file(&path)?;
+            *removed += 1;
+        }
+    }
+    Ok(())
+}
+
+// ── the shared folder's name ──────────────────────────────────────────────────
+
+/// The base name of the shared directory — the single path component the
+/// receiver turns into its sync root (`<output_dir>/<name>`, task 064).
+///
+/// The caller canonicalizes first, so `./abc/` and `/x/y/abc` both yield `abc`.
+/// A directory with no usable base name (a filesystem root) is a hard error:
+/// there is nothing to scope the receiver to, and defaulting to the bare output
+/// directory is exactly the behaviour this replaces.
+pub fn source_folder_name(dir: &Path) -> Result<String> {
+    let name = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "cannot derive a folder name from \"{}\" — share a named directory, \
+                 not a filesystem root",
+                dir.display()
+            )
+        })?
+        .to_string();
+    validate_path_component(&name)
+        .map_err(|e| anyhow::anyhow!("cannot share \"{}\": {e}", dir.display()))?;
+    Ok(name)
+}
+
+// ── sender ────────────────────────────────────────────────────────────────────
+
+/// Drive one whole send: hello → manifest → diff → the changed files → prune
+/// announcement → done. Any failure returns `Err` (non-zero exit), which is the
+/// documented cron story: re-running resumes, and the hash diff makes the repeat
+/// near-free (spec §7.3).
+pub async fn run_sender<W: Wire>(
+    wire: &mut W,
+    source_dir: &Path,
+    files: Vec<FileEntry>,
+    chunk_size: usize,
+) -> Result<SyncSummary> {
+    let source_count = files.len();
+    let source_bytes: u64 = files.iter().map(|f| f.size).sum();
+    let mut engine = SenderEngine::new(files);
+
+    // The receiver scopes its entire run to `<its -o>/<folder>`, so the name
+    // travels in the very first frame — before it touches the disk.
+    let folder = source_folder_name(source_dir)?;
+    wire.send(&Frame::Control(hello_frame(TransferMode::Sync, Some(folder.clone())))).await?;
+    super::log::event(&format!(
+        "hello sent (protocol v{PROTO_VERSION}, mode sync, folder \"{folder}\")"
+    ));
+    let mut batches = 0usize;
+    for batch in engine.manifest_batches() {
+        wire.send(&Frame::Control(batch)).await?;
+        batches += 1;
+    }
+    super::log::event(&format!(
+        "file list sent — {source_count} file(s), {}, in {batches} batch(es)",
+        super::format_size(source_bytes as usize),
+    ));
+
+    // Await the peer's hello + its complete file list. This is the long pause on
+    // a big tree: the recipient is hashing its own copy before it can answer.
+    super::log::step("Comparing with the recipient…");
+    super::log::event("waiting for the recipient's hello + file list (it is hashing its copy)");
+    let mut acks: Vec<PathHash> = Vec::new();
+    let (mut got_hello, mut got_ack) = (false, false);
+    while !(got_hello && got_ack) {
+        match wire.recv().await? {
+            // The recipient announces no folder of its own — the name is the
+            // sender's to give.
+            Frame::Control(ControlFrame::Hello { proto_version, mode, folder: _ }) => {
+                if let Err(e) =
+                    crate::transfer::engine::check_hello(proto_version, mode, TransferMode::Sync)
+                {
+                    abort(wire, &e.to_string()).await;
+                    return Err(e.into());
+                }
+                got_hello = true;
+                super::log::event(&format!(
+                    "recipient hello received (protocol v{proto_version}, mode {mode})"
+                ));
+            }
+            Frame::Control(ControlFrame::ManifestAck { files, more }) => {
+                acks.extend(files);
+                got_ack = !more;
+            }
+            Frame::Control(ControlFrame::Abort { reason }) => {
+                return Err(TransferError::PeerAbort(reason).into())
+            }
+            other => return Err(unexpected(&other, "hello/manifest ack")),
+        }
+    }
+
+    super::log::event(&format!("recipient's file list received — {} entry(ies)", acks.len()));
+    engine.on_manifest_ack(&acks);
+    let plan: Vec<FileEntry> = engine.plan().to_vec();
+    let delete_paths: Vec<String> = engine.delete_paths().to_vec();
+    super::log::step(&format!(
+        "Syncing {} file(s) ({}); {} unchanged, {} stale on the receiver",
+        plan.len(),
+        super::format_size(engine.planned_bytes() as usize),
+        engine.skipped(),
+        delete_paths.len(),
+    ));
+
+    let mut summary = SyncSummary {
+        skipped: engine.skipped() as u64,
+        kept: delete_paths.len() as u64,
+        ..Default::default()
+    };
+
+    if !plan.is_empty() {
+        super::log::step(&format!("Transferring {} file(s)…", plan.len()));
+    }
+    for (n, entry) in plan.iter().enumerate() {
+        loop {
+            super::log::event(&format!(
+                "sending {} ({}) [{}/{}]",
+                entry.path,
+                super::format_size(entry.size as usize),
+                n + 1,
+                plan.len(),
+            ));
+            let sent = send_one_file(wire, source_dir, entry, chunk_size).await?;
+            super::log::event(&format!("{} sent; waiting for the recipient to verify", entry.path));
+            match wire.recv().await? {
+                Frame::Control(ControlFrame::FileOk { path }) => {
+                    super::log::event(&format!("{path} verified and committed by the recipient"));
+                    summary.files_sent += 1;
+                    summary.bytes += sent;
+                    super::display::transfer_progress(
+                        summary.bytes as usize,
+                        engine.planned_bytes() as usize,
+                    );
+                    break;
+                }
+                Frame::Control(ControlFrame::FileFail { path, reason }) => {
+                    super::display::warn(&format!("Receiver rejected \"{path}\": {reason}"));
+                    match engine.on_file_fail(&path) {
+                        crate::transfer::engine::FailAction::Retry => {
+                            super::log::step(&format!("Retrying \"{path}\"…"));
+                            continue;
+                        }
+                        crate::transfer::engine::FailAction::Abort => {
+                            let msg = format!("\"{path}\" failed twice: {reason}");
+                            abort(wire, &msg).await;
+                            bail!("Transfer aborted — {msg}");
+                        }
+                    }
+                }
+                Frame::Control(ControlFrame::Abort { reason }) => {
+                    return Err(TransferError::PeerAbort(reason).into())
+                }
+                other => return Err(unexpected(&other, "file ack")),
+            }
+        }
+    }
+
+    if !delete_paths.is_empty() {
+        super::log::event(&format!(
+            "announcing {} stale path(s) to the recipient (it prunes only with --replace-delete)",
+            delete_paths.len(),
+        ));
+        wire.send(&Frame::Control(ControlFrame::Delete { paths: delete_paths })).await?;
+    }
+    super::log::step("Finishing up…");
+    wire.send(&Frame::Control(ControlFrame::Done {
+        files_sent: summary.files_sent,
+        bytes: summary.bytes,
+        deleted: 0,
+        skipped: summary.skipped,
+    }))
+    .await?;
+
+    // The receiver's own Done carries what it actually deleted.
+    super::log::event("done frame sent; waiting for the recipient's summary");
+    loop {
+        match wire.recv().await? {
+            Frame::Control(ControlFrame::Done { deleted, .. }) => {
+                super::log::event(&format!(
+                    "recipient's summary received ({deleted} deleted there)"
+                ));
+                summary.deleted = deleted;
+                summary.kept = summary.kept.saturating_sub(deleted);
+                break;
+            }
+            Frame::Control(ControlFrame::Abort { reason }) => {
+                return Err(TransferError::PeerAbort(reason).into())
+            }
+            // A late FileOk (retry raced) is harmless — keep waiting for Done.
+            Frame::Control(ControlFrame::FileOk { .. }) => continue,
+            other => return Err(unexpected(&other, "done")),
+        }
+    }
+    Ok(summary)
+}
+
+async fn send_one_file<W: Wire>(
+    wire: &mut W,
+    source_dir: &Path,
+    entry: &FileEntry,
+    chunk_size: usize,
+) -> Result<u64> {
+    let path = source_dir.join(&entry.path);
+    let mut f = BufReader::new(
+        File::open(&path).with_context(|| format!("cannot read \"{}\"", path.display()))?,
+    );
+    wire.send(&Frame::Control(ControlFrame::FileBegin {
+        path: entry.path.clone(),
+        size: entry.size,
+        mode: entry.mode,
+    }))
+    .await?;
+
+    let mut hasher = Hasher::new();
+    let mut buf = vec![0u8; chunk_size];
+    let mut total = 0u64;
+    loop {
+        let n = f
+            .read(&mut buf)
+            .with_context(|| format!("cannot read \"{}\"", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        total += n as u64;
+        wire.send(&Frame::Chunk(buf[..n].to_vec())).await?;
+    }
+    // The hash is recomputed while streaming rather than reused from the scan:
+    // the file may have changed since it was walked, and the receiver must verify
+    // what actually travelled.
+    wire.send(&Frame::Control(ControlFrame::FileEnd { hash: hasher.finish() })).await?;
+    Ok(total)
+}
+
+// ── receiver ──────────────────────────────────────────────────────────────────
+
+/// One file being written to its `.nullseal-part` temp name.
+struct PartFile {
+    rel: String,
+    part: PathBuf,
+    target: PathBuf,
+    file: File,
+    hasher: Hasher,
+    mode: u32,
+    existed: bool,
+    /// Declared size, and bytes in so far — the live `Receiving:` counter, which
+    /// is the only thing on screen during a multi-hundred-MB file.
+    declared: u64,
+    received: u64,
+}
+
+/// Read the sender's hello and turn it into this run's sync root.
+///
+/// This happens **before a single byte of the destination is read**, because the
+/// root is what bounds everything that follows: the scan, every write, every
+/// `.nullseal-part`, and the `--replace-delete` prune. `output_dir` itself is
+/// never the root — sharing `./abc` always lands in `<output_dir>/abc` (task
+/// 064), which is what makes escaping the output directory structurally
+/// impossible instead of merely guarded.
+async fn resolve_sync_root<W: Wire>(wire: &mut W, output_dir: &Path) -> Result<PathBuf> {
+    let folder = match wire.recv().await? {
+        Frame::Control(ControlFrame::Hello { proto_version, mode, folder }) => {
+            if let Err(e) = crate::transfer::engine::check_hello(proto_version, mode, TransferMode::Sync)
+            {
+                abort(wire, &e.to_string()).await;
+                return Err(e.into());
+            }
+            let Some(folder) = folder else {
+                let e = TransferError::MissingFolder;
+                abort(wire, &e.to_string()).await;
+                return Err(e.into());
+            };
+            super::log::event(&format!(
+                "sender hello received (protocol v{proto_version}, mode {mode}, folder \"{folder}\")"
+            ));
+            folder
+        }
+        Frame::Control(ControlFrame::Abort { reason }) => {
+            return Err(TransferError::PeerAbort(reason).into())
+        }
+        other => {
+            let e = TransferError::Unexpected(format!(
+                "{} while expecting the sender's hello",
+                frame_label(&other)
+            ));
+            abort(wire, &e.to_string()).await;
+            return Err(e.into());
+        }
+    };
+
+    // The name is attacker-controlled: it decides where files land. A separator,
+    // a `..`, an absolute path or a drive prefix aborts the run — no sanitising,
+    // no falling back to the bare output directory.
+    let root = match sync_root(output_dir, &folder) {
+        Ok(root) => root,
+        Err(e) => {
+            abort(wire, &e.to_string()).await;
+            return Err(e.into());
+        }
+    };
+
+    // Something that is not a directory already sitting at the root would be
+    // clobbered by `create_dir_all`'s failure path or, worse, redirect the whole
+    // run through a symlink. Refuse both, loudly.
+    if let Ok(meta) = fs::symlink_metadata(&root) {
+        if !meta.is_dir() {
+            let what = if meta.file_type().is_symlink() { "a symlink" } else { "a file" };
+            let msg = format!(
+                "cannot sync into \"{}\": {what} already exists there. \
+                 Move it aside or choose a different -o.",
+                root.display()
+            );
+            abort(wire, &msg).await;
+            bail!("{msg}");
+        }
+    }
+    fs::create_dir_all(&root)
+        .with_context(|| format!("cannot create the sync folder \"{}\"", root.display()))?;
+    // Resolve it now that it exists: a destructive operation must print the
+    // absolute path it is about to work on, not a relative "." .
+    Ok(fs::canonicalize(&root).unwrap_or(root))
+}
+
+/// Drive one whole receive. The sender's hello names the shared folder, so the
+/// run is scoped to `<output_dir>/<folder>` (created if absent) and touches
+/// nothing outside it; the resolved root is returned for the run summary.
+///
+/// Files are written to `.nullseal-part` temp names and atomically renamed only
+/// after their hash verifies; a populated root is merge-overwritten silently
+/// (spec §3), and extras are only removed with `--replace-delete`.
+pub async fn run_receiver<W: Wire>(
+    wire: &mut W,
+    output_dir: &Path,
+    opts: SyncOptions,
+) -> Result<(PathBuf, SyncSummary)> {
+    let dest_root = resolve_sync_root(wire, output_dir).await?;
+    let dest_root = dest_root.as_path();
+    let stale = discard_stale_parts(dest_root)?;
+    if stale > 0 {
+        super::log::event(&format!("discarded {stale} stale .nullseal-part file(s)"));
+    }
+    // Hashing the root is the receiver's longest silent stretch on a big mirror —
+    // announce it before, not after, and name the absolute path it is bounded to.
+    super::log::step(&format!("Scanning {}…", dest_root.display()));
+    let local = scan_dest(dest_root)?;
+    super::log::event(&format!(
+        "destination holds {} file(s) (hashed for the diff)",
+        local.len()
+    ));
+    let mut engine = ReceiverEngine::new(local, opts.replace_delete, opts.confirm_all);
+
+    wire.send(&Frame::Control(hello_frame(TransferMode::Sync, None))).await?;
+    super::log::event(&format!("hello sent (protocol v{PROTO_VERSION}, mode sync)"));
+    super::log::step("Comparing with the sender…");
+
+    let mut summary = SyncSummary::default();
+    let mut current: Option<PartFile> = None;
+    let mut acked = false;
+    let mut files_started = 0u64;
+
+    let result: Result<()> = async {
+        loop {
+            match wire.recv().await? {
+                Frame::Control(ControlFrame::Manifest { files, more }) => {
+                    if let Err(e) = engine.on_manifest(&files, more) {
+                        abort(wire, &e.to_string()).await;
+                        return Err(e.into());
+                    }
+                    if engine.manifest_complete() && !acked {
+                        acked = true;
+                        super::log::event(&format!(
+                            "sender declared {} file(s)",
+                            engine.source_count()
+                        ));
+                        let mut batches = 0usize;
+                        for batch in engine.ack_batches() {
+                            wire.send(&Frame::Control(batch)).await?;
+                            batches += 1;
+                        }
+                        super::log::event(&format!(
+                            "our file list sent back in {batches} batch(es); waiting for the sender's decision"
+                        ));
+                    }
+                }
+                Frame::Control(ControlFrame::FileBegin { path, size, mode }) => {
+                    if let Err(e) = engine.on_file_begin(&path) {
+                        abort(wire, &e.to_string()).await;
+                        return Err(e.into());
+                    }
+                    let target = dest_root.join(&path);
+                    if let Some(parent) = target.parent() {
+                        fs::create_dir_all(parent).with_context(|| {
+                            format!("cannot create \"{}\"", parent.display())
+                        })?;
+                    }
+                    let part = with_part_suffix(&target);
+                    let file = File::create(&part)
+                        .with_context(|| format!("cannot write \"{}\"", part.display()))?;
+                    if files_started == 0 {
+                        super::log::step("Receiving files…");
+                    }
+                    files_started += 1;
+                    super::log::event(&format!(
+                        "receiving {path} ({}) [#{files_started}]",
+                        super::format_size(size as usize)
+                    ));
+                    current = Some(PartFile {
+                        rel: path,
+                        existed: target.exists(),
+                        target,
+                        part,
+                        file,
+                        hasher: Hasher::new(),
+                        mode,
+                        declared: size,
+                        received: 0,
+                    });
+                }
+                Frame::Chunk(bytes) => {
+                    let Some(part) = current.as_mut() else {
+                        let e = TransferError::Unexpected("file chunk before FileBegin".into());
+                        abort(wire, &e.to_string()).await;
+                        return Err(e.into());
+                    };
+                    part.file
+                        .write_all(&bytes)
+                        .with_context(|| format!("cannot write \"{}\"", part.part.display()))?;
+                    part.hasher.update(&bytes);
+                    // Inline overwrite on a TTY, one line per finished file when
+                    // piped — never per chunk (see `log::progress`).
+                    part.received += bytes.len() as u64;
+                    super::display::receive_progress(
+                        part.received as usize,
+                        part.declared.max(part.received) as usize,
+                    );
+                }
+                Frame::Control(ControlFrame::FileEnd { hash }) => {
+                    let Some(part) = current.take() else {
+                        let e = TransferError::Unexpected("FileEnd before FileBegin".into());
+                        abort(wire, &e.to_string()).await;
+                        return Err(e.into());
+                    };
+                    match commit_part(&engine, part, &hash) {
+                        Ok((rel, bytes, existed)) => {
+                            summary.files_sent += 1;
+                            summary.bytes += bytes;
+                            if existed {
+                                summary.overwritten += 1;
+                            }
+                            super::log::event(&format!(
+                                "{rel} verified ({}) and moved into place{}",
+                                super::format_size(bytes as usize),
+                                if existed { ", replacing the previous copy" } else { "" },
+                            ));
+                            wire.send(&Frame::Control(ControlFrame::FileOk { path: rel })).await?;
+                        }
+                        Err((rel, reason)) => {
+                            super::log::event(&format!("{rel} rejected: {reason}"));
+                            wire.send(&Frame::Control(ControlFrame::FileFail {
+                                path: rel,
+                                reason,
+                            }))
+                            .await?;
+                        }
+                    }
+                }
+                Frame::Control(ControlFrame::Delete { paths }) => {
+                    super::log::event(&format!(
+                        "sender announced {} stale path(s)",
+                        paths.len()
+                    ));
+                    match engine.delete_decision(&paths) {
+                        Ok(DeleteDecision::Prune(list)) => {
+                            super::log::step(&format!("Pruning {} stale file(s)…", list.len()));
+                            summary.deleted = prune(dest_root, &list)? as u64;
+                        }
+                        Ok(DeleteDecision::Keep { count, reason }) => {
+                            summary.kept = count as u64;
+                            match reason {
+                                KeepReason::NotRequested => super::log::step(&format!(
+                                    "{count} stale file(s) kept (pass --replace-delete to mirror deletions)"
+                                )),
+                                KeepReason::FatFingerGuard => super::display::warn(&format!(
+                                    "Refusing to delete {count} file(s): the sender's file list is empty while \"{}\" is not. Re-run with --yes if that is really intended.",
+                                    dest_root.display()
+                                )),
+                            }
+                        }
+                        Err(e) => {
+                            abort(wire, &e.to_string()).await;
+                            return Err(e.into());
+                        }
+                    }
+                }
+                Frame::Control(ControlFrame::Done { skipped, .. }) => {
+                    super::log::event("sender's done frame received; sending our summary");
+                    summary.skipped = skipped;
+                    wire.send(&Frame::Control(ControlFrame::Done {
+                        files_sent: summary.files_sent,
+                        bytes: summary.bytes,
+                        deleted: summary.deleted,
+                        skipped: summary.skipped,
+                    }))
+                    .await?;
+                    return Ok(());
+                }
+                Frame::Control(ControlFrame::Abort { reason }) => {
+                    return Err(TransferError::PeerAbort(reason).into())
+                }
+                other => {
+                    let e = TransferError::Unexpected(frame_label(&other));
+                    abort(wire, &e.to_string()).await;
+                    return Err(e.into());
+                }
+            }
+        }
+    }
+    .await;
+
+    // Never leave a truncated file behind under a real name, on any exit path.
+    if let Some(part) = current.take() {
+        drop(part.file);
+        let _ = fs::remove_file(&part.part);
+    }
+    result?;
+    Ok((dest_root.to_path_buf(), summary))
+}
+
+/// Verify a finished part file and atomically move it into place.
+/// `Err((rel, reason))` means the file was discarded and a `FileFail` is due.
+///
+/// **`received != declared` is deliberately not an error.** The declared size comes
+/// from `FileBegin`, i.e. from the manifest scan; the sender recomputes the hash
+/// *while streaming* precisely because the file may have changed since it was
+/// walked (see `send_one_file`). The `FileEnd` hash therefore describes what
+/// actually travelled, and checking it is strictly stronger than any length
+/// comparison — a truncated transfer fails the hash. Rejecting on a size
+/// difference would instead turn that documented, benign race into a spurious
+/// failure. The mismatch is worth *saying* at `--verbose`, which is what it is
+/// used for below.
+///
+/// Fields are bound explicitly rather than with `..` on purpose: a future field
+/// added to `PartFile` must break this destructure and be decided about here.
+fn commit_part(
+    engine: &ReceiverEngine,
+    part: PartFile,
+    expected_hash: &str,
+) -> std::result::Result<(String, u64, bool), (String, String)> {
+    let PartFile { rel, part: part_path, target, file, hasher, mode, existed, declared, received } =
+        part;
+    if received != declared {
+        super::log::event(&format!(
+            "{rel}: {} arrived but the manifest declared {} — the source changed while it was \
+             being read; the FileEnd hash decides",
+            super::format_size(received as usize),
+            super::format_size(declared as usize),
+        ));
+    }
+    let bytes = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if let Err(e) = file.sync_all() {
+        let _ = fs::remove_file(&part_path);
+        return Err((rel, format!("cannot flush the received file: {e}")));
+    }
+    drop(file);
+
+    let actual = hasher.finish();
+    if let Err(e) = engine.verify(&rel, expected_hash, &actual) {
+        let _ = fs::remove_file(&part_path);
+        return Err((rel, e.to_string()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&part_path, fs::Permissions::from_mode(mode & 0o777));
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
+    if let Err(e) = fs::rename(&part_path, &target) {
+        let _ = fs::remove_file(&part_path);
+        return Err((rel, format!("cannot move the file into place: {e}")));
+    }
+    Ok((rel, bytes, existed))
+}
+
+fn with_part_suffix(target: &Path) -> PathBuf {
+    let mut name = target.file_name().unwrap_or_default().to_os_string();
+    name.push(PART_SUFFIX);
+    target.with_file_name(name)
+}
+
+/// Delete the pruned paths (files only; the caller has already gated this).
+pub fn prune(root: &Path, paths: &[String]) -> Result<usize> {
+    let mut deleted = 0;
+    for rel in paths {
+        let path = root.join(rel);
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                super::log::event(&format!("deleted {rel}"));
+                deleted += 1;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                super::display::warn(&format!("Cannot delete \"{}\": {e}", path.display()));
+            }
+        }
+    }
+    Ok(deleted)
+}
+
+/// `--replace-delete` on a **zip** folder share: after extraction, remove
+/// destination files that the archive did not contain (spec §3).
+pub fn prune_extras(dest: &Path, kept: &BTreeSet<String>) -> Result<usize> {
+    let extras: Vec<String> = scan_dest(dest)?
+        .into_iter()
+        .map(|p| p.path)
+        .filter(|p| !kept.contains(p))
+        .collect();
+    prune(dest, &extras)
+}
+
+// ── shared helpers ────────────────────────────────────────────────────────────
+
+async fn abort<W: Wire>(wire: &mut W, reason: &str) {
+    let _ = wire.send(&Frame::Control(ControlFrame::Abort { reason: reason.to_string() })).await;
+}
+
+fn frame_label(frame: &Frame) -> String {
+    match frame {
+        Frame::Chunk(b) => format!("unexpected {}-byte chunk", b.len()),
+        Frame::Control(c) => format!("unexpected control frame {c:?}"),
+    }
+}
+
+fn unexpected(frame: &Frame, expecting: &str) -> anyhow::Error {
+    TransferError::Unexpected(format!("{} while expecting {expecting}", frame_label(frame))).into()
+}
+
+/// Format the mandatory run summary. Always names the destination — the only
+/// mitigation for a mistyped `-o` now that a populated destination is accepted
+/// silently (spec §3).
+pub fn format_receiver_summary(dest: &Path, s: &SyncSummary) -> String {
+    format!(
+        "Synced into {} — {} written ({} overwritten), {} unchanged, {} deleted, {} stale kept",
+        dest.display(),
+        s.files_sent,
+        s.overwritten,
+        s.skipped,
+        s.deleted,
+        s.kept,
+    )
+}
+
+/// Sender-side counterpart of [`format_receiver_summary`].
+pub fn format_sender_summary(source: &Path, s: &SyncSummary) -> String {
+    format!(
+        "Synced {} — {} file(s) sent ({}), {} unchanged, {} deleted, {} stale kept",
+        source.display(),
+        s.files_sent,
+        super::format_size(s.bytes as usize),
+        s.skipped,
+        s.deleted,
+        s.kept,
+    )
+}
+
+// ── real DataChannel wires ────────────────────────────────────────────────────
+
+/// Sender-side wire over the WebRTC DataChannel.
+pub struct SenderWire<'a> {
+    pub peer: &'a mut crate::webrtc::SenderPeer,
+    pub sealer: Sealer,
+    pub unsealer: Unsealer,
+}
+
+impl Wire for SenderWire<'_> {
+    async fn send(&mut self, frame: &Frame) -> Result<()> {
+        let sealed = self.sealer.seal(&encode_frame(frame)?)?;
+        self.peer.send_binary(sealed).await
+    }
+    async fn recv(&mut self) -> Result<Frame> {
+        loop {
+            match self.peer.next_event().await {
+                Some(crate::webrtc::LoopEvent::BinaryData(data)) => {
+                    return Ok(decode_message(&self.unsealer.unseal(&data)?)?)
+                }
+                Some(crate::webrtc::LoopEvent::Message(_)) => continue,
+                Some(crate::webrtc::LoopEvent::Error(e)) => {
+                    bail!("WebRTC error during transfer: {e}")
+                }
+                Some(crate::webrtc::LoopEvent::Done) | None => {
+                    bail!("DataChannel closed before the transfer finished")
+                }
+                _ => continue,
+            }
+        }
+    }
+}
+
+/// Receiver-side wire over the WebRTC DataChannel.
+pub struct ReceiverWire<'a> {
+    pub peer: &'a mut crate::webrtc::ReceiverPeer,
+    pub sealer: Sealer,
+    pub unsealer: Unsealer,
+}
+
+impl Wire for ReceiverWire<'_> {
+    async fn send(&mut self, frame: &Frame) -> Result<()> {
+        let sealed = self.sealer.seal(&encode_frame(frame)?)?;
+        self.peer.send_binary(sealed).await
+    }
+    async fn recv(&mut self) -> Result<Frame> {
+        loop {
+            match self.peer.next_event().await {
+                Some(crate::webrtc::LoopEvent::BinaryData(data)) => {
+                    return Ok(decode_message(&self.unsealer.unseal(&data)?)?)
+                }
+                Some(crate::webrtc::LoopEvent::Message(_)) => continue,
+                Some(crate::webrtc::LoopEvent::Error(e)) => {
+                    bail!("WebRTC error during transfer: {e}")
+                }
+                Some(crate::webrtc::LoopEvent::Done) | None => {
+                    bail!("DataChannel closed before the transfer finished")
+                }
+                _ => continue,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+
+    /// In-memory wire pair. Frames go through the real `encode_frame` /
+    /// `decode_message`, so framing is exercised; sealing is covered separately
+    /// (it would cost two PBKDF2 derivations per test).
+    struct Loopback {
+        tx: UnboundedSender<Vec<u8>>,
+        rx: UnboundedReceiver<Vec<u8>>,
+        /// Bytes of file payload this side put on the wire — the assertion that
+        /// a steady-state re-run moves nothing.
+        chunk_bytes: Arc<AtomicU64>,
+        chunk_frames: Arc<AtomicU64>,
+    }
+
+    fn loopback_pair() -> (Loopback, Loopback) {
+        let (a_tx, b_rx) = unbounded_channel();
+        let (b_tx, a_rx) = unbounded_channel();
+        (
+            Loopback {
+                tx: a_tx,
+                rx: a_rx,
+                chunk_bytes: Arc::new(AtomicU64::new(0)),
+                chunk_frames: Arc::new(AtomicU64::new(0)),
+            },
+            Loopback {
+                tx: b_tx,
+                rx: b_rx,
+                chunk_bytes: Arc::new(AtomicU64::new(0)),
+                chunk_frames: Arc::new(AtomicU64::new(0)),
+            },
+        )
+    }
+
+    impl Wire for Loopback {
+        async fn send(&mut self, frame: &Frame) -> Result<()> {
+            if let Frame::Chunk(b) = frame {
+                self.chunk_bytes.fetch_add(b.len() as u64, Ordering::Relaxed);
+                self.chunk_frames.fetch_add(1, Ordering::Relaxed);
+            }
+            let bytes = encode_frame(frame)?;
+            self.tx.send(bytes).map_err(|_| anyhow::anyhow!("loopback closed"))
+        }
+        async fn recv(&mut self) -> Result<Frame> {
+            match self.rx.recv().await {
+                Some(bytes) => Ok(decode_message(&bytes)?),
+                None => bail!("loopback closed"),
+            }
+        }
+    }
+
+    /// Run a whole sender+receiver session concurrently over a loopback pair.
+    /// Returns both summaries plus the byte/frame counters the sender produced.
+    ///
+    /// `out` is the receiver's **output dir**, not its sync root: the run lands in
+    /// `out/<source base name>`, which is what [`sync_root_is`] resolves.
+    async fn sync_once(
+        source: &Path,
+        out: &Path,
+        opts: SyncOptions,
+    ) -> Result<(SyncSummary, SyncSummary, u64, u64)> {
+        let (mut a, mut b) = loopback_pair();
+        let bytes = a.chunk_bytes.clone();
+        let frames = a.chunk_frames.clone();
+        let (files, _) = scan_source(source, &[])?;
+        let src = source.to_path_buf();
+        let dst = out.to_path_buf();
+        let send = async move { run_sender(&mut a, &src, files, 16 * 1024).await };
+        let recv = async move { run_receiver(&mut b, &dst, opts).await };
+        let (s, r) = tokio::join!(send, recv);
+        Ok((s?, r?.1, bytes.load(Ordering::Relaxed), frames.load(Ordering::Relaxed)))
+    }
+
+    /// Where a sync of `source` into output dir `out` actually lands.
+    fn sync_root_is(out: &Path, source: &Path) -> PathBuf {
+        out.join(source.file_name().unwrap())
+    }
+
+    fn write(path: &Path, body: &[u8]) {
+        if let Some(p) = path.parent() {
+            fs::create_dir_all(p).unwrap();
+        }
+        fs::write(path, body).unwrap();
+    }
+
+    fn fixture(root: &Path) {
+        write(&root.join("a.txt"), b"alpha");
+        write(&root.join("sub/b.txt"), b"beta");
+        write(&root.join("sub/deep/c.bin"), &vec![7u8; 40_000]);
+    }
+
+    #[tokio::test]
+    async fn first_run_materialises_the_whole_tree_inside_the_named_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let out = tmp.path().join("out");
+        fixture(&src);
+
+        let (s, r, bytes, _) = sync_once(&src, &out, SyncOptions::default()).await.unwrap();
+        let root = sync_root_is(&out, &src);
+        assert_eq!(s.files_sent, 3);
+        assert_eq!(r.files_sent, 3);
+        assert_eq!(s.skipped, 0);
+        assert_eq!(bytes, 5 + 4 + 40_000);
+        // Everything lands under `<out>/src`, never directly in `<out>`.
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(fs::read(root.join("sub/b.txt")).unwrap(), b"beta");
+        assert_eq!(fs::read(root.join("sub/deep/c.bin")).unwrap(), vec![7u8; 40_000]);
+        assert!(!out.join("a.txt").exists(), "-o itself must stay untouched");
+        assert_eq!(
+            fs::read_dir(&out).unwrap().count(),
+            1,
+            "the run may create exactly one entry in -o: the sync root"
+        );
+        // No temp files survive a clean run.
+        assert!(scan_dest(&root).unwrap().iter().all(|p| !p.path.ends_with(PART_SUFFIX)));
+    }
+
+    #[tokio::test]
+    async fn the_sync_root_is_created_when_it_does_not_exist() {
+        // The owner's case: `get` with no `-o`, into a directory that has never
+        // seen this folder. The root must be created, and only the root.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("abc");
+        let out = tmp.path().join("cwd");
+        fixture(&src);
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("unrelated.txt"), b"mine").unwrap();
+
+        let (_, r, _, _) = sync_once(&src, &out, SyncOptions::default()).await.unwrap();
+        assert_eq!(r.files_sent, 3);
+        assert!(out.join("abc").is_dir(), "the sync root must be created when absent");
+        assert_eq!(fs::read(out.join("abc/a.txt")).unwrap(), b"alpha");
+        assert_eq!(
+            fs::read(out.join("unrelated.txt")).unwrap(),
+            b"mine",
+            "a file beside the root is not part of the sync"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_sitting_at_the_root_path_errors_instead_of_being_clobbered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("abc");
+        let out = tmp.path().join("out");
+        fixture(&src);
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("abc"), b"i am a file, not a folder").unwrap();
+
+        let (mut a, mut b) = loopback_pair();
+        let (files, _) = scan_source(&src, &[]).unwrap();
+        let src2 = src.clone();
+        let out2 = out.clone();
+        let send = async move { run_sender(&mut a, &src2, files, 16 * 1024).await };
+        let recv = async move { run_receiver(&mut b, &out2, SyncOptions::default()).await };
+        let (_, r) = tokio::join!(send, recv);
+
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("a file already exists there"), "{err}");
+        assert_eq!(
+            fs::read(out.join("abc")).unwrap(),
+            b"i am a file, not a folder",
+            "the existing file must survive untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn re_run_over_an_unchanged_tree_transfers_zero_bytes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let out = tmp.path().join("out");
+        let dst = sync_root_is(&out, &src);
+        fixture(&src);
+        sync_once(&src, &out, SyncOptions::default()).await.unwrap();
+
+        // Second run: same tree on both sides.
+        let (s, r, bytes, frames) = sync_once(&src, &out, SyncOptions::default()).await.unwrap();
+        assert_eq!(frames, 0, "no chunk frame may be sent for an unchanged tree");
+        assert_eq!(bytes, 0, "no file bytes may cross the wire on a steady-state re-run");
+        assert_eq!(s.files_sent, 0);
+        assert_eq!(s.bytes, 0);
+        assert_eq!(s.skipped, 3);
+        assert_eq!(r.files_sent, 0);
+        assert_eq!(r.overwritten, 0);
+        // The destination is still intact.
+        assert_eq!(fs::read(dst.join("sub/b.txt")).unwrap(), b"beta");
+    }
+
+    #[tokio::test]
+    async fn only_changed_and_new_files_travel_on_a_re_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let out = tmp.path().join("out");
+        let dst = sync_root_is(&out, &src);
+        fixture(&src);
+        sync_once(&src, &out, SyncOptions::default()).await.unwrap();
+
+        write(&src.join("sub/b.txt"), b"beta-changed");
+        write(&src.join("new.txt"), b"n");
+        let (s, r, bytes, _) = sync_once(&src, &out, SyncOptions::default()).await.unwrap();
+        assert_eq!(s.files_sent, 2, "only the changed + new file");
+        assert_eq!(s.skipped, 2);
+        assert_eq!(bytes, "beta-changed".len() as u64 + 1);
+        assert_eq!(r.overwritten, 1, "the changed file replaced an existing one");
+        assert_eq!(fs::read(dst.join("sub/b.txt")).unwrap(), b"beta-changed");
+        assert_eq!(fs::read(dst.join("new.txt")).unwrap(), b"n");
+    }
+
+    #[tokio::test]
+    async fn a_populated_destination_is_merge_overwritten_silently() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let out = tmp.path().join("out");
+        let dst = sync_root_is(&out, &src);
+        fixture(&src);
+        write(&dst.join("a.txt"), b"mine-old");
+        write(&dst.join("unrelated.txt"), b"keep me");
+
+        let (_, r, _, _) = sync_once(&src, &out, SyncOptions::default()).await.unwrap();
+        assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"alpha", "collision overwritten");
+        assert_eq!(
+            fs::read(dst.join("unrelated.txt")).unwrap(),
+            b"keep me",
+            "extras are left alone without --replace-delete"
+        );
+        assert_eq!(r.kept, 1, "the stale extra is reported, not deleted");
+        assert_eq!(r.overwritten, 1);
+    }
+
+    #[tokio::test]
+    async fn replace_delete_prunes_destination_extras() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let out = tmp.path().join("out");
+        let dst = sync_root_is(&out, &src);
+        fixture(&src);
+        write(&dst.join("stale.txt"), b"gone soon");
+        write(&dst.join("old/deep.txt"), b"gone too");
+
+        let opts = SyncOptions { replace_delete: true, confirm_all: false };
+        let (s, r, _, _) = sync_once(&src, &out, opts).await.unwrap();
+        assert_eq!(r.deleted, 2);
+        assert_eq!(s.deleted, 2, "the sender's summary reflects the receiver's deletions");
+        assert!(!dst.join("stale.txt").exists());
+        assert!(!dst.join("old/deep.txt").exists());
+        assert!(dst.join("a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn replace_delete_cannot_reach_anything_outside_the_sync_root() {
+        // The catastrophic case the scoping exists to make impossible: run
+        // `--replace-delete` with the output dir full of unrelated files and
+        // prove the prune is confined to `<out>/<folder>`.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        let out = tmp.path().join("out");
+        let dst = sync_root_is(&out, &src);
+        fixture(&src);
+        // Sentinels *beside* the root — a file, and a whole sibling tree.
+        write(&out.join("precious.txt"), b"do not delete");
+        write(&out.join("photos/holiday.jpg"), b"jpeg");
+        // …and a real stale extra *inside* the root, which must go.
+        write(&dst.join("stale.txt"), b"gone soon");
+
+        let opts = SyncOptions { replace_delete: true, confirm_all: true };
+        let (_, r, _, _) = sync_once(&src, &out, opts).await.unwrap();
+        assert_eq!(r.deleted, 1, "only the extra inside the root may be pruned");
+        assert!(!dst.join("stale.txt").exists());
+        assert_eq!(fs::read(out.join("precious.txt")).unwrap(), b"do not delete");
+        assert_eq!(fs::read(out.join("photos/holiday.jpg")).unwrap(), b"jpeg");
+    }
+
+    #[tokio::test]
+    async fn an_escaping_folder_name_aborts_before_anything_is_written() {
+        // A hostile sender picks the name, so it is validated as a single path
+        // component. None of these may create, write or delete anything.
+        for hostile in ["../escape", "../../.ssh", "/etc", "sub/dir", "..", ".", "", "C:\\Windows"]
+        {
+            let tmp = tempfile::tempdir().unwrap();
+            let out = tmp.path().join("out");
+            fs::create_dir_all(&out).unwrap();
+            write(&out.join("precious.txt"), b"mine");
+            write(&tmp.path().join("escape.txt"), b"outside");
+
+            let (mut a, mut b) = loopback_pair();
+            let out2 = out.clone();
+            let recv = tokio::spawn(async move {
+                run_receiver(&mut b, &out2, SyncOptions { replace_delete: true, confirm_all: true })
+                    .await
+            });
+            a.send(&Frame::Control(ControlFrame::Hello {
+                proto_version: PROTO_VERSION,
+                mode: TransferMode::Sync,
+                folder: Some(hostile.to_string()),
+            }))
+            .await
+            .unwrap();
+
+            let err = recv.await.unwrap().unwrap_err().to_string();
+            assert!(err.contains("unsafe path"), "{hostile:?} → {err}");
+            // Nothing created, nothing deleted, nothing escaped.
+            assert_eq!(fs::read(out.join("precious.txt")).unwrap(), b"mine");
+            assert_eq!(fs::read(tmp.path().join("escape.txt")).unwrap(), b"outside");
+            assert!(!tmp.path().join("escape").exists());
+            assert_eq!(fs::read_dir(&out).unwrap().count(), 1, "{hostile:?} created something");
+
+            // …and the peer was told why.
+            let mut aborted = None;
+            while let Ok(frame) = a.recv().await {
+                if let Frame::Control(ControlFrame::Abort { reason }) = frame {
+                    aborted = Some(reason);
+                    break;
+                }
+            }
+            assert!(
+                aborted.is_some_and(|r| r.contains("unsafe path")),
+                "the receiver must send a typed abort for {hostile:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_sync_hello_without_a_folder_name_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let (mut a, mut b) = loopback_pair();
+        let out2 = out.clone();
+        let recv =
+            tokio::spawn(async move { run_receiver(&mut b, &out2, SyncOptions::default()).await });
+        a.send(&Frame::Control(ControlFrame::Hello {
+            proto_version: PROTO_VERSION,
+            mode: TransferMode::Sync,
+            folder: None,
+        }))
+        .await
+        .unwrap();
+        let err = recv.await.unwrap().unwrap_err().to_string();
+        assert!(err.contains("did not name the shared folder"), "{err}");
+        assert!(!out.exists(), "a folder-less hello may not create the output dir");
+    }
+
+    #[test]
+    fn the_shared_folder_name_is_the_directory_base_name() {
+        assert_eq!(source_folder_name(Path::new("/x/y/abc")).unwrap(), "abc");
+        assert_eq!(source_folder_name(Path::new("/x/y/abc/")).unwrap(), "abc");
+        // A filesystem root cannot name a sync root — refuse rather than fall
+        // back to the bare output directory.
+        assert!(source_folder_name(Path::new("/")).is_err());
+    }
+
+    #[tokio::test]
+    async fn fat_finger_guard_keeps_files_when_the_source_is_empty() {
+        // Now that the root is the *shared folder's* name, an empty source only
+        // meets a populated root when it carries the same name — so the source is
+        // an empty `proj` in its own parent, mirroring a wiped-out workspace.
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("wiped/proj");
+        let out = tmp.path().join("out");
+        let dst = sync_root_is(&out, &src);
+        fs::create_dir_all(&src).unwrap();
+        write(&dst.join("precious.txt"), b"do not delete");
+
+        let opts = SyncOptions { replace_delete: true, confirm_all: false };
+        let (_, r, _, _) = sync_once(&src, &out, opts).await.unwrap();
+        assert_eq!(r.deleted, 0);
+        assert_eq!(r.kept, 1);
+        assert_eq!(fs::read(dst.join("precious.txt")).unwrap(), b"do not delete");
+
+        // --yes overrides the guard.
+        let opts = SyncOptions { replace_delete: true, confirm_all: true };
+        let (_, r, _, _) = sync_once(&src, &out, opts).await.unwrap();
+        assert_eq!(r.deleted, 1);
+        assert!(!dst.join("precious.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn an_unsafe_path_aborts_the_run_with_nothing_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let dst = out.join("proj");
+        let (mut a, mut b) = loopback_pair();
+        let out2 = out.clone();
+        let recv = tokio::spawn(async move {
+            run_receiver(&mut b, &out2, SyncOptions::default()).await.map(|_| ())
+        });
+
+        a.send(&Frame::Control(hello_frame(TransferMode::Sync, Some("proj".into()))))
+            .await
+            .unwrap();
+        a.send(&Frame::Control(ControlFrame::Manifest {
+            files: vec![FileEntry {
+                path: "../escape.txt".into(),
+                size: 1,
+                mode: 0o644,
+                hash: "h".into(),
+            }],
+            more: false,
+        }))
+        .await
+        .unwrap();
+
+        let err = recv.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("unsafe path"), "{err}");
+        assert!(!tmp.path().join("escape.txt").exists());
+        assert!(!out.join("escape.txt").exists());
+        assert!(scan_dest(&dst).unwrap().is_empty(), "nothing may be written");
+        // …and the receiver told the peer why (after its own hello).
+        let mut aborted = None;
+        while let Ok(frame) = a.recv().await {
+            if let Frame::Control(ControlFrame::Abort { reason }) = frame {
+                aborted = Some(reason);
+                break;
+            }
+        }
+        let reason = aborted.expect("the receiver must send a typed abort");
+        assert!(reason.contains("escape.txt"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn a_version_mismatch_aborts_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let (mut a, mut b) = loopback_pair();
+        let out2 = out.clone();
+        let recv = tokio::spawn(async move {
+            run_receiver(&mut b, &out2, SyncOptions::default()).await.map(|_| ())
+        });
+        a.send(&Frame::Control(ControlFrame::Hello {
+            proto_version: 99,
+            mode: TransferMode::Sync,
+            folder: Some("proj".into()),
+        }))
+        .await
+        .unwrap();
+        let err = recv.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("version mismatch"), "{err}");
+        assert!(!out.exists(), "a rejected hello may not create anything");
+    }
+
+    #[tokio::test]
+    async fn a_hash_mismatch_is_rejected_and_leaves_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let dst = out.join("proj");
+        let (mut a, mut b) = loopback_pair();
+        let out2 = out.clone();
+        let recv = tokio::spawn(async move { run_receiver(&mut b, &out2, SyncOptions::default()).await });
+
+        a.send(&Frame::Control(hello_frame(TransferMode::Sync, Some("proj".into()))))
+            .await
+            .unwrap();
+        a.send(&Frame::Control(ControlFrame::Manifest { files: vec![], more: false }))
+            .await
+            .unwrap();
+        // Drain the receiver's hello + ack.
+        for _ in 0..2 {
+            a.recv().await.unwrap();
+        }
+        a.send(&Frame::Control(ControlFrame::FileBegin {
+            path: "corrupt.txt".into(),
+            size: 3,
+            mode: 0o644,
+        }))
+        .await
+        .unwrap();
+        a.send(&Frame::Chunk(b"abc".to_vec())).await.unwrap();
+        a.send(&Frame::Control(ControlFrame::FileEnd { hash: "not-the-hash".into() }))
+            .await
+            .unwrap();
+        match a.recv().await.unwrap() {
+            Frame::Control(ControlFrame::FileFail { path, reason }) => {
+                assert_eq!(path, "corrupt.txt");
+                assert!(reason.contains("hash mismatch"), "{reason}");
+            }
+            other => panic!("expected FileFail, got {other:?}"),
+        }
+        assert!(!dst.join("corrupt.txt").exists(), "a failed file is never committed");
+        assert!(
+            !with_part_suffix(&dst.join("corrupt.txt")).exists(),
+            "the temp part must be discarded"
+        );
+
+        a.send(&Frame::Control(ControlFrame::Done {
+            files_sent: 0,
+            bytes: 0,
+            deleted: 0,
+            skipped: 0,
+        }))
+        .await
+        .unwrap();
+        let (root, summary) = recv.await.unwrap().unwrap();
+        assert_eq!(summary.files_sent, 0);
+        assert_eq!(root.file_name().unwrap(), "proj", "the run reports its resolved root");
+    }
+
+    #[tokio::test]
+    async fn a_file_that_shrank_since_the_scan_is_committed_on_its_hash_not_its_declared_size() {
+        // The sender declares the size it saw when it walked the tree, but hashes
+        // what it actually streams. A file edited in between therefore arrives
+        // with a size that disagrees with the manifest — and that must NOT be an
+        // error, or every log/db file under active write would fail the sync.
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let dst = out.join("proj");
+        let (mut a, mut b) = loopback_pair();
+        let out2 = out.clone();
+        let recv =
+            tokio::spawn(async move { run_receiver(&mut b, &out2, SyncOptions::default()).await });
+
+        a.send(&Frame::Control(hello_frame(TransferMode::Sync, Some("proj".into()))))
+            .await
+            .unwrap();
+        a.send(&Frame::Control(ControlFrame::Manifest { files: vec![], more: false }))
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            a.recv().await.unwrap(); // the receiver's hello + ack
+        }
+        // Declared 9_000 bytes, three actually sent — with the hash of the three.
+        a.send(&Frame::Control(ControlFrame::FileBegin {
+            path: "shrank.log".into(),
+            size: 9_000,
+            mode: 0o644,
+        }))
+        .await
+        .unwrap();
+        a.send(&Frame::Chunk(b"abc".to_vec())).await.unwrap();
+        a.send(&Frame::Control(ControlFrame::FileEnd {
+            hash: crate::transfer::engine::sha256_hex_bytes(b"abc"),
+        }))
+        .await
+        .unwrap();
+
+        match a.recv().await.unwrap() {
+            Frame::Control(ControlFrame::FileOk { path }) => assert_eq!(path, "shrank.log"),
+            other => panic!("a short-but-correctly-hashed file must commit, got {other:?}"),
+        }
+        assert_eq!(fs::read(dst.join("shrank.log")).unwrap(), b"abc");
+
+        a.send(&Frame::Control(ControlFrame::Done {
+            files_sent: 1,
+            bytes: 3,
+            deleted: 0,
+            skipped: 0,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(recv.await.unwrap().unwrap().1.files_sent, 1);
+    }
+
+    #[tokio::test]
+    async fn stale_part_files_are_discarded_on_startup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("dst");
+        write(&dst.join("keep.txt"), b"k");
+        write(&dst.join(format!("interrupted.txt{PART_SUFFIX}")), b"half");
+        write(&dst.join(format!("sub/deep.bin{PART_SUFFIX}")), b"half");
+
+        assert_eq!(discard_stale_parts(&dst).unwrap(), 2);
+        assert!(!dst.join(format!("interrupted.txt{PART_SUFFIX}")).exists());
+        assert!(dst.join("keep.txt").exists());
+        // A stale part never counts as destination content for the diff.
+        assert_eq!(
+            scan_dest(&dst).unwrap().iter().map(|p| p.path.clone()).collect::<Vec<_>>(),
+            vec!["keep.txt".to_string()]
+        );
+    }
+
+    #[test]
+    fn scan_source_hashes_files_skips_dirs_and_reports_excludes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("src");
+        fixture(&src);
+        fs::create_dir_all(src.join("emptydir")).unwrap();
+        write(&src.join("skip.log"), b"noise");
+
+        let (files, links) = scan_source(&src, &["*.log".to_string()]).unwrap();
+        let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, vec!["a.txt", "sub/b.txt", "sub/deep/c.bin"]);
+        assert!(links.is_empty());
+        let a = files.iter().find(|f| f.path == "a.txt").unwrap();
+        assert_eq!(a.size, 5);
+        assert_eq!(a.hash, crate::transfer::engine::sha256_hex_bytes(b"alpha"));
+    }
+
+    #[test]
+    fn scan_dest_ignores_a_nullsealignore_in_the_destination() {
+        // A mirror must see everything really present: an ignore file that
+        // travelled with the sync must not hide destination files from the diff.
+        let tmp = tempfile::tempdir().unwrap();
+        let dst = tmp.path().join("dst");
+        write(&dst.join(".nullsealignore"), b"*.log\n");
+        write(&dst.join("app.log"), b"x");
+        let paths: Vec<String> = scan_dest(&dst).unwrap().into_iter().map(|p| p.path).collect();
+        assert_eq!(paths, vec![".nullsealignore".to_string(), "app.log".to_string()]);
+    }
+
+    #[test]
+    fn sealed_frames_round_trip_and_reject_a_wrong_password() {
+        let mut sealer = Sealer::new("sync-password");
+        let meta = sealer.metadata();
+        let f1 = sealer.seal(b"frame one").unwrap();
+        let f2 = sealer.seal(b"frame two").unwrap();
+        assert_ne!(&f1[8..], &f2[8..], "each frame gets its own nonce");
+        assert_eq!(&f1[..8], &0u64.to_be_bytes());
+        assert_eq!(&f2[..8], &1u64.to_be_bytes());
+
+        let mut unsealer = Unsealer::new(&meta, "sync-password").unwrap();
+        assert_eq!(unsealer.unseal(&f1).unwrap(), b"frame one");
+        assert_eq!(unsealer.unseal(&f2).unwrap(), b"frame two");
+
+        let mut wrong = Unsealer::new(&meta, "not-the-password").unwrap();
+        assert!(wrong.unseal(&f1).is_err());
+        // A truncated envelope is a clean error, never a panic.
+        assert!(Unsealer::new(&meta, "sync-password").unwrap().unseal(&[0u8; 4]).is_err());
+    }
+
+    #[test]
+    fn prune_extras_removes_only_what_the_archive_did_not_contain() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("proj");
+        write(&dest.join("readme.txt"), b"r");
+        write(&dest.join("sub/keep.txt"), b"k");
+        write(&dest.join("stale.txt"), b"s");
+
+        let kept: BTreeSet<String> =
+            ["readme.txt".to_string(), "sub/keep.txt".to_string()].into_iter().collect();
+        assert_eq!(prune_extras(&dest, &kept).unwrap(), 1);
+        assert!(dest.join("readme.txt").exists());
+        assert!(dest.join("sub/keep.txt").exists());
+        assert!(!dest.join("stale.txt").exists());
+    }
+
+    #[test]
+    fn summaries_name_the_destination_and_the_counts() {
+        let s = SyncSummary {
+            files_sent: 2,
+            bytes: 2048,
+            skipped: 5,
+            deleted: 1,
+            kept: 0,
+            overwritten: 1,
+        };
+        let text = format_receiver_summary(Path::new("/tmp/mirror"), &s);
+        assert!(text.contains("/tmp/mirror"), "{text}");
+        assert!(text.contains("2 written (1 overwritten)"), "{text}");
+        assert!(text.contains("5 unchanged"), "{text}");
+        assert!(text.contains("1 deleted"), "{text}");
+        let text = format_sender_summary(Path::new("/tmp/src"), &s);
+        assert!(text.contains("/tmp/src") && text.contains("2 file(s) sent"), "{text}");
+    }
+}

@@ -2,12 +2,15 @@ use clap::{Parser, Subcommand};
 use std::io::{self, Write};
 
 mod api;
+mod archive;
 mod commands;
 mod crypto;
 mod local;
 mod local_server;
 mod p2p;
 mod retry;
+mod transfer;
+mod walker;
 mod webrtc;
 
 #[derive(Parser)]
@@ -26,9 +29,17 @@ mod webrtc;
       --text             Share as text (default)
       --file             Share as file
       --pwd              Share as a password-type secret
-  -t, --type <TYPE>      Type alias: txt | file | pwd
+      --zip              Pack a directory into one <folder>.zip and share that
+                         (all modes; required for folders in upload mode)
+      --sync             Transfer a directory's files directly, no archive; unchanged
+                         files are skipped by hash (--p2p / --local only)
+      --exclude <PAT>    Exclude files matching a gitignore-style pattern
+                         (repeatable; requires --zip or --sync)
+      --exclude-from <F> Read gitignore-style patterns from a file (repeatable;
+                         requires --zip or --sync; applied before --exclude)
+  -t, --type <TYPE>      Type alias: txt | file | pwd | zip | sync
   -T, --ttl <TTL>        Expiration: e.g. 1h, 24h, 3d, 7d (default: 24h, max: 7d)
-  -1, --one-time         One-time read (default; negate with --no-one-time)
+  -1, --one-time         One-time read (always on for server shares)
   -a, --address <ADDR>   Bind address for local transfer
 
 \x1b[1;4mGet options:\x1b[0m
@@ -36,6 +47,11 @@ mod webrtc;
   -o, --output <DIR>     Output directory for received files
       --local            Discover sender via mDNS on local network
   -a, --address <ADDR>   Direct host:port for local transfer (skips mDNS)
+      --no-extract       Keep a received folder share as <folder>.zip (skip auto-extract;
+                         ignored on a --sync transfer, where there is no archive)
+      --replace-delete   Mirror: overwrite same-name files AND delete files in the
+                         destination that the sender no longer has
+  -y, --yes              Confirm a --replace-delete prune whose source list is empty
 
 \x1b[1;4mManage options:\x1b[0m
   -c, --command <CMD>    Action: replace | destroy
@@ -59,8 +75,13 @@ mod webrtc;
 \x1b[1;4mExamples:\x1b[0m
   nullseal share \"hello world\" -p mypass
   nullseal share \"secret\" -p mypass -T 1h
-  nullseal share \"secret\" -p mypass --ttl 3d --no-one-time
   nullseal share ./doc.pdf -p mypass --file
+  nullseal share ./myfolder -p mypass --zip
+  nullseal share ./myfolder -p mypass --zip --exclude '*.log' --exclude 'node_modules/'
+  nullseal share ./myfolder -p mypass --sync --local
+  nullseal share ./myfolder -p mypass --sync --local -a 192.168.1.5:9000 \\
+      --exclude-from ~/.nullseal-ignore
+  nullseal get <SYNC-URL> -p mypass -o ./mirror --replace-delete
   nullseal share \"secret\" -p mypass --p2p
   nullseal share \"secret\" -p mypass --local
   nullseal share \"secret\" -p mypass --local -a 192.168.1.5
@@ -104,7 +125,7 @@ enum Commands {
         // -- value-based flags --
         #[arg(short, long, help = "Transfer mode (alias for the booleans): upload | p2p | local")]
         mode: Option<String>,
-        #[arg(short = 't', long = "type", help = "Content type (alias for the booleans): txt | file | pwd")]
+        #[arg(short = 't', long = "type", help = "Content type (alias for the booleans): txt | file | pwd | zip | sync")]
         content_type: Option<String>,
         // -- boolean flags --
         #[arg(long, help = "Share as file")]
@@ -113,6 +134,16 @@ enum Commands {
         text: bool,
         #[arg(long, help = "Share as a password-type secret")]
         pwd: bool,
+        #[arg(long, help = "Pack a directory into a zip and share it as <folder>.zip (required for folder shares in upload mode)")]
+        zip: bool,
+        #[arg(long, help = "Transfer a directory's files directly, no archive; unchanged files are skipped by hash (--p2p / --local only)")]
+        sync: bool,
+        #[arg(long = "exclude", value_name = "PATTERN",
+              help = "Exclude files matching a gitignore-style pattern (repeatable; requires --zip or --sync)")]
+        exclude: Vec<String>,
+        #[arg(long = "exclude-from", value_name = "FILE",
+              help = "Read gitignore-style patterns from a file (repeatable; requires --zip or --sync)")]
+        exclude_from: Vec<String>,
         #[arg(long, help = "Peer-to-peer transfer via server signaling")]
         p2p: bool,
         #[arg(long, help = "Short-time upload (default)")]
@@ -126,7 +157,7 @@ enum Commands {
               help = "Expiration: e.g. 1h, 24h, 3d, 7d (default: 24h, max: 7d)")]
         ttl: Option<String>,
         #[arg(short = '1', long = "one-time", default_value_t = true,
-              help = "One-time read (default: true; negate with --no-one-time)")]
+              help = "One-time read (always on for server shares)")]
         one_time: bool,
     },
     #[command(about = "Retrieve and decrypt a share")]
@@ -143,6 +174,14 @@ enum Commands {
         #[arg(short = 'a', long = "address",
               help = "Direct host:port for local transfer (skip mDNS discovery)")]
         address: Option<String>,
+        #[arg(long = "no-extract", help = "Keep a received folder share as <folder>.zip (skip auto-extract; ignored on a --sync transfer)")]
+        no_extract: bool,
+        #[arg(long = "replace-delete",
+              help = "Mirror the sender: overwrite same-name files and delete destination files the sender no longer has")]
+        replace_delete: bool,
+        #[arg(short = 'y', long = "yes",
+              help = "Confirm a --replace-delete prune whose source file list is empty")]
+        yes: bool,
     },
     #[command(about = "Replace or destroy a share using an owner code")]
     Manage {
@@ -193,7 +232,8 @@ enum CheckTarget {
 }
 
 fn prompt_password() -> String {
-    eprint!("\x1b[1;33m🔑 Password:\x1b[0m ");
+    // Same margin as the log column it sits in. (task 067)
+    eprint!("{}\x1b[1;33m› Password:\x1b[0m ", commands::log::MARGIN);
     io::stderr().flush().ok();
     rpassword::read_password().unwrap_or_default()
 }
@@ -217,10 +257,16 @@ enum DestroyConfirm {
 fn confirm_destroy() -> DestroyConfirm {
     use std::io::IsTerminal;
     if !io::stdin().is_terminal() {
-        eprintln!("Refusing to destroy without confirmation. Re-run with --yes.");
+        eprintln!(
+            "{}Refusing to destroy without confirmation. Re-run with --yes.",
+            commands::log::MARGIN
+        );
         return DestroyConfirm::NoTty;
     }
-    eprint!("This permanently destroys the share and cannot be undone. Type 'yes' to confirm: ");
+    eprint!(
+        "{}This permanently destroys the share and cannot be undone. Type 'yes' to confirm: ",
+        commands::log::MARGIN
+    );
     io::stderr().flush().ok();
     let mut line = String::new();
     if io::stdin().read_line(&mut line).is_err() {
@@ -284,7 +330,7 @@ async fn async_main() {
             };
             std::process::exit(code);
         }
-        Commands::Share { content, password, mode, content_type, file, text, pwd, p2p, upload, local, address, ttl, one_time } => {
+        Commands::Share { content, password, mode, content_type, file, text, pwd, zip, sync, exclude, exclude_from, p2p, upload, local, address, ttl, one_time } => {
             let content = stdin_content.unwrap_or(content);
             let password = if pipe_mode {
                 password.unwrap_or_default()
@@ -292,23 +338,14 @@ async fn async_main() {
                 password.unwrap_or_else(prompt_password)
             };
 
-            // Validate the -t/--type alias value up front.
+            // Validate the -t/--type alias value up front. `zip` and `sync` are
+            // first-class aliases of the two folder flags (task 058).
             if let Some(ref t) = content_type {
-                if !matches!(t.as_str(), "txt" | "file" | "pwd") {
-                    commands::log::error(&format!("Unknown content type: {t}. Supported: txt, file, pwd"));
+                if !matches!(t.as_str(), "txt" | "file" | "pwd" | "zip" | "sync") {
+                    commands::log::error(&format!("Unknown content type: {t}. Supported: txt, file, pwd, zip, sync"));
                     std::process::exit(1);
                 }
             }
-            // Merge content type: --file/--text/--pwd booleans + -t/--type alias.
-            let file = file || matches!(content_type.as_deref(), Some("file"));
-            let text = text || matches!(content_type.as_deref(), Some("txt"));
-            let pwd = pwd || matches!(content_type.as_deref(), Some("pwd"));
-            if (file as u8 + text as u8 + pwd as u8) > 1 {
-                commands::log::error("--file, --text and --pwd are mutually exclusive");
-                std::process::exit(1);
-            }
-            let resolved_content_type = if file { "file" } else if pwd { "password" } else { "txt" };
-
             // Validate the -m/--mode alias value (upload | p2p | local; `u` = upload back-compat).
             if let Some(ref m) = mode {
                 if !matches!(m.as_str(), "upload" | "u" | "p2p" | "local") {
@@ -320,6 +357,9 @@ async fn async_main() {
             // NB: don't fold `local` into `p2p` — dispatch routes `--local` to run_local
             // regardless, and `resolved_mode` is only read on the non-local branch. Folding
             // it made `--local --upload` trip the `p2p && upload` check (wrong message).
+            // Merged BEFORE the folder validators so the `--sync` mode gate (task
+            // 058: sync needs --p2p/--local) sees the effective mode, aliases
+            // included.
             let local = local || matches!(mode.as_deref(), Some("local"));
             let p2p = p2p || matches!(mode.as_deref(), Some("p2p"));
             let upload = upload || matches!(mode.as_deref(), Some("upload" | "u"));
@@ -331,16 +371,73 @@ async fn async_main() {
                 commands::log::error("--local and --upload are mutually exclusive");
                 std::process::exit(1);
             }
+            // Merge the folder-mode aliases into their booleans (task 058), the
+            // same way `-m/--mode` is merged above. This MUST happen before every
+            // validator below, or `-t zip` / `-t sync` would slip past each gate
+            // that only inspects the booleans.
+            let zip = zip || matches!(content_type.as_deref(), Some("zip"));
+            let sync = sync || matches!(content_type.as_deref(), Some("sync"));
+            // Folder modes (task 051 `--zip`, task 058 `--sync`): a directory
+            // without either flag is a hard error naming both — no auto-detection,
+            // no silent fall-back to sharing the path as text. All the combination
+            // rules live in share::validate_folder_flags.
+            if let Err(e) = commands::share::validate_folder_flags(
+                zip, sync, text, pwd, content_type.as_deref(), p2p, local, address.is_some(), &content,
+            ) {
+                commands::log::error(&format!("{e}"));
+                std::process::exit(1);
+            }
+            // `--exclude` / `--exclude-from` filter the shared folder tree (tasks
+            // 052 / 058), so they are only meaningful with `--zip` or `--sync` —
+            // reject them otherwise instead of silently ignoring them.
+            if let Err(e) = commands::share::validate_exclude_flag(zip, sync, &exclude) {
+                commands::log::error(&format!("{e}"));
+                std::process::exit(1);
+            }
+            if let Err(e) = commands::share::validate_exclude_from_flag(zip, sync, &exclude_from) {
+                commands::log::error(&format!("{e}"));
+                std::process::exit(1);
+            }
+            // Resolve --exclude-from files into patterns here, in the command
+            // layer: `walker::walk` stays pure and shared with archive::pack.
+            // Order (lowest → highest): .nullsealignore → each --exclude-from file
+            // → --exclude. A missing file is a hard error, never a silent skip.
+            let exclude = match commands::share::resolve_exclude_patterns(&exclude_from, &exclude) {
+                Ok(p) => p,
+                Err(e) => {
+                    commands::log::error(&format!("{e}"));
+                    std::process::exit(1);
+                }
+            };
+            // Merge content type: --file/--text/--pwd booleans + -t/--type alias.
+            let file = file || matches!(content_type.as_deref(), Some("file"));
+            let text = text || matches!(content_type.as_deref(), Some("txt"));
+            let pwd = pwd || matches!(content_type.as_deref(), Some("pwd"));
+            if (file as u8 + text as u8 + pwd as u8) > 1 {
+                commands::log::error("--file, --text and --pwd are mutually exclusive");
+                std::process::exit(1);
+            }
+            let resolved_content_type = if sync {
+                "sync"
+            } else if zip {
+                "zip"
+            } else if file {
+                "file"
+            } else if pwd {
+                "password"
+            } else {
+                "txt"
+            };
 
             if local {
-                commands::share::run_local(content, password, resolved_content_type, address, &mut |s| commands::log::result(s)).await
+                commands::share::run_local_with_excludes(content, password, resolved_content_type, address, &exclude, &mut |s| commands::log::result(s)).await
             } else {
                 if address.is_some() {
                     commands::log::error("-a/--address requires --local");
                     std::process::exit(1);
                 }
                 let resolved_mode = if p2p { "p2p" } else { "u" };
-                commands::share::run(content, password, resolved_mode, resolved_content_type, None, ttl, one_time, relay_only, &mut |s| commands::log::result(s)).await
+                commands::share::run_with_excludes(content, password, resolved_mode, resolved_content_type, None, ttl, one_time, relay_only, &exclude, &mut |s| commands::log::result(s)).await
             }
         }
         Commands::Manage { owner_code, password, content, action, replace, destroy, yes, content_type, text, file, pwd } => {
@@ -368,7 +465,7 @@ async fn async_main() {
                 match confirm_destroy() {
                     DestroyConfirm::Confirmed => {}
                     DestroyConfirm::Declined => {
-                        eprintln!("Aborted.");
+                        eprintln!("{}Aborted.", commands::log::MARGIN);
                         std::process::exit(1);
                     }
                     DestroyConfirm::NoTty => std::process::exit(1),
@@ -406,18 +503,23 @@ async fn async_main() {
 
             commands::manage::run(owner_code, resolved_action, content, password, content_type_flag, None, &mut |s| commands::log::result(s)).await
         }
-        Commands::Get { url, password, output, local, address } => {
+        Commands::Get { url, password, output, local, address, no_extract, replace_delete, yes } => {
             let password = if pipe_mode {
                 password.unwrap_or_default()
             } else {
                 password.unwrap_or_else(prompt_password)
             };
+            if yes && !replace_delete {
+                commands::log::error("-y/--yes only applies to --replace-delete");
+                std::process::exit(1);
+            }
+            let extract_opts = commands::get::ExtractOpts { no_extract, replace_delete, yes };
 
             if local {
                 if url.is_some() {
                     commands::display::warn("Ignoring URL argument — using local transfer.");
                 }
-                commands::get::run_local(password, output, address, &mut |s| commands::log::result(s)).await
+                commands::get::run_local(password, output, address, extract_opts, &mut |s| commands::log::result(s)).await
             } else {
                 if address.is_some() {
                     commands::log::error("-a/--address requires --local");
@@ -427,7 +529,7 @@ async fn async_main() {
                     commands::log::error("Missing <URL>. Provide a share URL or use --local for local discovery.");
                     std::process::exit(1);
                 });
-                commands::get::run(url, password, output, None, relay_only, &mut |s| commands::log::result(s)).await
+                commands::get::run(url, password, output, None, relay_only, extract_opts, &mut |s| commands::log::result(s)).await
             }
         }
     };

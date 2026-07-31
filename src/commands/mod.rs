@@ -5,6 +5,8 @@ pub mod log;
 pub mod manage;
 pub mod p2p_stages;
 pub mod share;
+pub mod sync_flow;
+pub mod sync_tcp;
 
 /// Map an `ApiError` from a first server call to an anyhow error, appending an
 /// actionable connectivity hint ONLY for connection-class failures (couldn't
@@ -80,7 +82,10 @@ pub fn confirm_unsafe_file(filename: &str) -> anyhow::Result<()> {
     if !std::io::stdin().is_terminal() {
         return Ok(());
     }
-    eprint!("Warning: \"{}\" has an uncommon extension. Save anyway? [y/N] ", filename);
+    eprint!(
+        "{}Warning: \"{}\" has an uncommon extension. Save anyway? [y/N] ",
+        log::MARGIN, filename
+    );
     let mut input = String::new();
     std::io::stdin().read_line(&mut input)?;
     if !input.trim().eq_ignore_ascii_case("y") {
@@ -104,6 +109,21 @@ pub fn deduplicate_path(path: std::path::PathBuf) -> std::path::PathBuf {
         }
     }
     path
+}
+
+/// Human display for a server size limit (task 056): exact MiB/KiB multiples
+/// render as whole numbers ("10 MB", "512 KB") so the common case reads like
+/// the product copy; anything else falls back to `format_size`.
+pub fn format_limit(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    if bytes >= MB && bytes % MB == 0 {
+        format!("{} MB", bytes / MB)
+    } else if bytes >= KB && bytes % KB == 0 {
+        format!("{} KB", bytes / KB)
+    } else {
+        format_size(bytes as usize)
+    }
 }
 
 pub fn format_size(bytes: usize) -> String {

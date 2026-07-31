@@ -70,6 +70,46 @@ fn is_private_lan_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
+/// Extract the host part of `host`, `host:port` or `[v6]:port` as an IP address.
+/// Returns `None` when the host is a name (e.g. `localhost`) rather than a literal.
+fn parse_host_ip(addr: &str) -> Option<std::net::IpAddr> {
+    if let Ok(sa) = addr.parse::<SocketAddr>() {
+        return Some(sa.ip());
+    }
+    if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
+        return Some(ip);
+    }
+    addr.split(':').next()?.parse().ok()
+}
+
+/// Choose the IP the **receiver** advertises in its ICE host candidate.
+///
+/// `sender_addr` is the *sender's* `host[:port]` (from `-a`, or from mDNS
+/// discovery) — the address of the *other* machine. It must never be reused as
+/// our own bind/advertise address: doing so makes the sender aim its
+/// connectivity checks at its own IP and learn ours only peer-reflexively
+/// (`remote unknown` in the selected pair).
+///
+/// - Loopback sender (`127.0.0.1`, `::1`): both ends are on this machine, so
+///   keep loopback. This is the same-host path the whole e2e suite exercises.
+/// - Anything else (LAN IP, or a name we cannot resolve to a literal): use
+///   *this* machine's own LAN IP via [`discover_local_ip`].
+pub fn receiver_bind_ip(sender_addr: &str) -> Option<std::net::IpAddr> {
+    receiver_bind_ip_with(sender_addr, discover_local_ip)
+}
+
+/// Testable core of [`receiver_bind_ip`] — `own_ip` stands in for this machine's
+/// address so the two-machine case can be pinned without a second machine.
+fn receiver_bind_ip_with(
+    sender_addr: &str,
+    own_ip: impl FnOnce() -> std::net::IpAddr,
+) -> Option<std::net::IpAddr> {
+    match parse_host_ip(sender_addr) {
+        Some(ip) if ip.is_loopback() => Some(ip),
+        _ => Some(own_ip()),
+    }
+}
+
 pub async fn bind_udp(bind_ip: Option<std::net::IpAddr>) -> Result<(UdpSocket, SocketAddr)> {
     let ip = bind_ip.unwrap_or_else(discover_local_ip);
     // Always bind to 0.0.0.0 so the socket can receive from any interface.
@@ -134,6 +174,84 @@ mod tests {
     fn discover_local_ip_returns_valid_ip() {
         let ip = discover_local_ip();
         assert!(!ip.is_unspecified());
+    }
+
+    // ── receiver_bind_ip ─────────────────────────────────────────────────────
+    // The receiver must advertise ITS OWN address, never the sender's. On one
+    // machine the two coincide, which is why this went unnoticed; `own_ip` here
+    // is a distinct host so the difference is observable.
+    const OWN: fn() -> IpAddr = || IpAddr::V4(Ipv4Addr::new(192, 168, 0, 235));
+
+    #[test]
+    fn remote_sender_yields_our_own_ip_not_the_senders() {
+        // Field repro: sender 192.168.0.128, receiver 192.168.0.235.
+        let chosen = receiver_bind_ip_with("192.168.0.128:56270", OWN);
+        assert_eq!(
+            chosen,
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 235))),
+            "receiver must advertise its own LAN IP, not the sender's",
+        );
+        assert_ne!(chosen, Some(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 128))));
+    }
+
+    #[test]
+    fn remote_sender_without_port_still_yields_our_own_ip() {
+        assert_eq!(
+            receiver_bind_ip_with("10.0.0.7", OWN),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 235))),
+        );
+    }
+
+    #[test]
+    fn loopback_sender_keeps_loopback() {
+        // Same-machine runs (and the entire e2e suite) pass `-a 127.0.0.1`.
+        // Switching these to the LAN IP would change same-host behavior.
+        assert_eq!(
+            receiver_bind_ip_with("127.0.0.1:8080", OWN),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        );
+        assert_eq!(
+            receiver_bind_ip_with("127.0.0.1", OWN),
+            Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        );
+        assert_eq!(
+            receiver_bind_ip_with("[::1]:8080", OWN),
+            Some(IpAddr::V6(Ipv6Addr::LOCALHOST)),
+        );
+    }
+
+    #[test]
+    fn hostname_sender_falls_back_to_our_own_ip() {
+        // Unchanged from the previous behavior: an unparseable host meant
+        // `None`, which `bind_udp` resolved via `discover_local_ip()`.
+        assert_eq!(
+            receiver_bind_ip_with("some-host.local:8080", OWN),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 235))),
+        );
+    }
+
+    #[test]
+    fn parse_host_ip_handles_the_forms_we_accept() {
+        assert_eq!(
+            parse_host_ip("192.168.0.128:56270"),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 128))),
+        );
+        assert_eq!(
+            parse_host_ip("192.168.0.128"),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 128))),
+        );
+        assert_eq!(parse_host_ip("[::1]:9"), Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(parse_host_ip("::1"), Some(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert_eq!(parse_host_ip("localhost:8080"), None);
+    }
+
+    #[test]
+    fn receiver_bind_ip_uses_real_discovery_for_a_remote_sender() {
+        // The public wrapper must resolve to a usable local address, never the
+        // sender's.
+        let chosen = receiver_bind_ip("192.168.0.128:56270").unwrap();
+        assert!(!chosen.is_unspecified());
+        assert_eq!(chosen, discover_local_ip());
     }
 
     #[tokio::test]

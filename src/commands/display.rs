@@ -19,11 +19,66 @@ fn hline(width: usize) -> String {
     BOX_H.repeat(width)
 }
 
-/// Approximate visible column width: ASCII = 1, wide/emoji chars = 2.
+/// Visible column width of one char.
+///
+/// The old rule — "non-ASCII means width 2" — was only ever right because the
+/// only non-ASCII the boxes carried were emoji. Task 066 replaced those with
+/// narrow glyphs (`›`, `↻`, `…`, box drawing), which a terminal renders in
+/// **one** column; counting them as two would over-pad every box line by one
+/// column per glyph. So: genuinely wide characters (emoji, CJK, fullwidth
+/// forms) are 2, everything else is 1.
+fn char_width(c: char) -> usize {
+    let cp = c as u32;
+    let wide = matches!(cp,
+        // East Asian Wide / Fullwidth
+        0x1100..=0x115F        // Hangul Jamo
+        | 0x2E80..=0x303E      // CJK radicals, Kangxi, CJK symbols & punctuation
+        | 0x3041..=0x33FF      // Hiragana, Katakana, Bopomofo, CJK compatibility
+        | 0x3400..=0x4DBF      // CJK unified ideographs ext A
+        | 0x4E00..=0x9FFF      // CJK unified ideographs
+        | 0xA000..=0xA4CF      // Yi
+        | 0xAC00..=0xD7A3      // Hangul syllables
+        | 0xF900..=0xFAFF      // CJK compatibility ideographs
+        | 0xFE30..=0xFE6F      // CJK compatibility forms, small form variants
+        | 0xFF00..=0xFF60      // Fullwidth forms
+        | 0xFFE0..=0xFFE6      // Fullwidth signs
+        // Emoji presentation (the ranges that default to a double-width cell)
+        | 0x231A..=0x231B      // ⌚ ⌛
+        | 0x23E9..=0x23F3      // ⏩ … ⏳
+        | 0x25FD..=0x25FE
+        | 0x2614..=0x2615
+        | 0x2648..=0x2653
+        | 0x267F | 0x2693 | 0x26A1
+        | 0x26AA..=0x26AB
+        | 0x26BD..=0x26BE
+        | 0x26C4..=0x26C5
+        | 0x26CE | 0x26D4 | 0x26EA
+        | 0x26F2..=0x26F3
+        | 0x26F5 | 0x26FA | 0x26FD
+        | 0x2705
+        | 0x270A..=0x270B
+        | 0x2728 | 0x274C | 0x274E
+        | 0x2753..=0x2755
+        | 0x2757
+        | 0x2795..=0x2797
+        | 0x27B0 | 0x27BF
+        | 0x2B1B..=0x2B1C
+        | 0x2B50 | 0x2B55
+        | 0x1F300..=0x1F64F    // symbols & pictographs, emoticons
+        | 0x1F680..=0x1F6FF    // transport & map
+        | 0x1F900..=0x1F9FF    // supplemental symbols & pictographs
+        | 0x1FA70..=0x1FAFF    // symbols & pictographs extended-A
+    );
+    if wide {
+        2
+    } else {
+        1
+    }
+}
+
+/// Approximate visible column width of a string (see [`char_width`]).
 fn display_width(s: &str) -> usize {
-    s.chars()
-        .map(|c| if c.is_ascii() { 1 } else { 2 })
-        .sum()
+    s.chars().map(char_width).sum()
 }
 
 /// Strip ANSI escape sequences for width calculation.
@@ -74,7 +129,7 @@ pub fn print_server_share_result(
     eprintln!();
 
     boxed_section(
-        "📤 Share",
+        "Share",
         &[
             ("ID:", share_id),
             ("URL:", share_url),
@@ -86,7 +141,7 @@ pub fn print_server_share_result(
     eprintln!();
 
     boxed_section(
-        "🔐 Owner",
+        "Owner",
         &[
             ("Code:", owner_code),
             ("Manage:", manage_url),
@@ -105,7 +160,7 @@ pub fn print_p2p_share_result(session_id: &str, p2p_url: &str) {
 
     let width = 60;
     boxed_section(
-        "📡 P2P Session",
+        "P2P Session",
         &[
             ("ID:", session_id),
             ("URL:", p2p_url),
@@ -117,7 +172,7 @@ pub fn print_p2p_share_result(session_id: &str, p2p_url: &str) {
     eprintln!();
     print_qr(p2p_url);
     eprintln!();
-    eprintln!("  {YELLOW}⏳ Waiting for recipient…{RESET}");
+    eprintln!("  {YELLOW}› Waiting for recipient…{RESET}");
 }
 
 pub fn print_local_share_result(addr: &str) {
@@ -127,7 +182,7 @@ pub fn print_local_share_result(addr: &str) {
 
     let width = 60;
     boxed_section(
-        "📡 Local Transfer",
+        "Local Transfer",
         &[
             ("Address:", addr),
             ("CLI:", &format!("{CYAN}nullseal get --local{RESET}")),
@@ -137,7 +192,7 @@ pub fn print_local_share_result(addr: &str) {
     );
 
     eprintln!();
-    eprintln!("  {YELLOW}⏳ Waiting for recipient…{RESET}");
+    eprintln!("  {YELLOW}› Waiting for recipient…{RESET}");
 }
 
 fn print_qr(url: &str) {
@@ -155,27 +210,33 @@ fn print_qr(url: &str) {
 
 /// Print a success status message (a milestone). Routed through the leveled
 /// logger: shown in Normal + Verbose, suppressed in Pipe.
+///
+/// Written at `log::MARGIN`, like every other human-facing line. (067)
 pub fn status(msg: &str) {
     if super::log::is_pipe() {
         return;
     }
+    let margin = super::log::MARGIN;
     if super::log::stderr_is_tty() {
-        eprintln!("\x1b[1;32m✓\x1b[0m {msg}");
+        eprintln!("{margin}\x1b[1;32m✓\x1b[0m {msg}");
     } else {
-        eprintln!("✓ {msg}");
+        eprintln!("{margin}✓ {msg}");
     }
 }
 
 /// Print a warning message (a milestone). Suppressed in Pipe.
+///
+/// Same margin as everything else — the bold-yellow `⚠` is the emphasis. (067)
 #[allow(dead_code)]
 pub fn warn(msg: &str) {
     if super::log::is_pipe() {
         return;
     }
+    let margin = super::log::MARGIN;
     if super::log::stderr_is_tty() {
-        eprintln!("\x1b[1;33m⚠\x1b[0m {msg}");
+        eprintln!("{margin}\x1b[1;33m⚠\x1b[0m {msg}");
     } else {
-        eprintln!("⚠ {msg}");
+        eprintln!("{margin}⚠ {msg}");
     }
 }
 
@@ -209,11 +270,12 @@ impl Spinner {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_clone = stop.clone();
         let msg = msg.to_owned();
+        let margin = super::log::MARGIN;
         let handle = std::thread::spawn(move || {
             let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let mut i = 0;
             while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                eprint!("\r\x1b[1;36m{}\x1b[0m {}\x1b[K", frames[i % frames.len()], msg);
+                eprint!("\r{margin}\x1b[1;36m{}\x1b[0m {}\x1b[K", frames[i % frames.len()], msg);
                 i += 1;
                 std::thread::sleep(std::time::Duration::from_millis(80));
             }
@@ -258,13 +320,32 @@ mod tests {
 
     #[test]
     fn display_width_emoji() {
-        // Non-ASCII chars counted as width 2
+        // Genuinely wide chars still count as 2 columns.
         assert_eq!(display_width("📡"), 2);
+        assert_eq!(display_width("⏳"), 2);
+        assert_eq!(display_width("漢"), 2);
     }
 
     #[test]
     fn display_width_mixed() {
         assert_eq!(display_width("a📡b"), 4); // 1 + 2 + 1
+    }
+
+    #[test]
+    fn display_width_narrow_glyphs_are_one_column() {
+        // Task 066: the CLI's status glyphs are single-width. Counting them as 2
+        // (the old "non-ASCII ⇒ wide" rule) over-padded every boxed line.
+        for g in ["›", "↻", "✓", "✗", "⚠", "·", "…", "─", "│"] {
+            assert_eq!(display_width(g), 1, "{g} must be one column");
+        }
+    }
+
+    #[test]
+    fn display_width_box_titles_are_plain_ascii() {
+        // Titles carry no glyph any more, so their width is just their length.
+        for t in ["Share", "Owner", "P2P Session", "Local Transfer"] {
+            assert_eq!(display_width(t), t.len());
+        }
     }
 
     #[test]

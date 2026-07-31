@@ -11,7 +11,62 @@ use tokio::sync::mpsc;
 
 use nullseal_turn::indication;
 
+use super::ice_log::{self, CandidateInfo};
 use super::{LoopCmd, LoopEvent, TurnRelay};
+
+/// Candidate bookkeeping used only for the `--verbose` ICE diagnostics.
+///
+/// `local` is fixed at construction (the CLI does not trickle — see
+/// `ice_log`); `remote` grows as the peer's SDP is applied and as trickled
+/// `p2p:ice` candidates arrive, so the selected-pair line can name both types.
+pub(crate) struct IceDebug {
+    pub local: Vec<CandidateInfo>,
+    pub remote: Vec<CandidateInfo>,
+    /// Set when ICE reports Connected; the next outbound transmit reveals the
+    /// nominated pair, which we then log exactly once.
+    pending_pair_log: bool,
+}
+
+impl IceDebug {
+    pub fn new(local: Vec<CandidateInfo>, remote: Vec<CandidateInfo>) -> Self {
+        IceDebug { local, remote, pending_pair_log: false }
+    }
+
+    fn note_remote_json(&mut self, v: &Value) {
+        if let Some(c) = ice_log::candidate_from_json(v) {
+            if !self.remote.contains(&c) {
+                self.remote.push(c);
+            }
+        }
+    }
+
+    fn note_remote_sdp(&mut self, sdp: &str) {
+        for c in ice_log::parse_sdp_candidates(sdp) {
+            if !self.remote.contains(&c) {
+                self.remote.push(c);
+            }
+        }
+    }
+
+    /// ICE reached Connected/Completed — arm the one-shot selected-pair log.
+    fn arm_pair_log(&mut self) {
+        self.pending_pair_log = true;
+    }
+
+    /// Log the nominated pair once, on the first transmit after ICE connected.
+    fn note_transmit(&mut self, source: SocketAddr, destination: SocketAddr) {
+        if !self.pending_pair_log {
+            return;
+        }
+        self.pending_pair_log = false;
+        crate::commands::log::event(&ice_log::format_selected_pair(
+            &self.local,
+            &self.remote,
+            source,
+            destination,
+        ));
+    }
+}
 
 /// A pending frame queued for SCTP delivery (text or binary).
 enum PendingFrame {
@@ -51,6 +106,32 @@ fn json_to_ice(v: &Value) -> Option<str0m::Candidate> {
     str0m::Candidate::from_sdp_string(s).ok()
 }
 
+/// Apply a trickled remote candidate, recording it for the ICE diagnostics.
+fn apply_remote_ice(rtc: &mut Rtc, ice_debug: &mut IceDebug, v: &Value) {
+    ice_debug.note_remote_json(v);
+    if let Some(c) = json_to_ice(v) {
+        rtc.add_remote_candidate(c);
+    }
+}
+
+/// Apply the peer's SDP answer, recording the candidates it carries so the
+/// selected-pair line can name the remote candidate's type.
+fn apply_remote_answer(
+    rtc: &mut Rtc,
+    ice_debug: &mut IceDebug,
+    pending_offer: &mut Option<SdpPendingOffer>,
+    v: &Value,
+) {
+    if let Some(sdp_str) = v["sdp"]["sdp"].as_str().or_else(|| v["sdp"].as_str()) {
+        ice_debug.note_remote_sdp(sdp_str);
+        if let Ok(answer) = SdpAnswer::from_sdp_string(sdp_str) {
+            if let Some(pending) = pending_offer.take() {
+                let _ = rtc.sdp_api().accept_answer(pending, answer);
+            }
+        }
+    }
+}
+
 /// The sans-I/O event loop that drives str0m's state machine.
 ///
 /// Owns the UDP socket and processes commands from the peer layer
@@ -64,6 +145,7 @@ pub async fn run(
     mut pending_offer: Option<SdpPendingOffer>,
     mut channel_id: Option<ChannelId>,
     mut turn_relay: Option<TurnRelay>,
+    mut ice_debug: IceDebug,
 ) {
     let mut buf = vec![0u8; 65_535];
     let mut channel_open = false;
@@ -164,18 +246,10 @@ pub async fn run(
                         cmd = cmd_rx.recv(), if !closing => {
                             match cmd {
                                 Some(LoopCmd::AddIceCandidate(v)) => {
-                                    if let Some(c) = json_to_ice(&v) {
-                                        rtc.add_remote_candidate(c);
-                                    }
+                                    apply_remote_ice(&mut rtc, &mut ice_debug, &v);
                                 }
                                 Some(LoopCmd::ApplyAnswer(v)) => {
-                                    if let Some(sdp_str) = v["sdp"]["sdp"].as_str().or_else(|| v["sdp"].as_str()) {
-                                        if let Ok(answer) = SdpAnswer::from_sdp_string(sdp_str) {
-                                            if let Some(pending) = pending_offer.take() {
-                                                let _ = rtc.sdp_api().accept_answer(pending, answer);
-                                            }
-                                        }
-                                    }
+                                    apply_remote_answer(&mut rtc, &mut ice_debug, &mut pending_offer, &v);
                                 }
                                 Some(LoopCmd::SendData(frame)) => {
                                     pending_sends.push_back(PendingFrame::Text(frame));
@@ -197,18 +271,10 @@ pub async fn run(
                                                 break;
                                             }
                                             Ok(LoopCmd::AddIceCandidate(v)) => {
-                                                if let Some(c) = json_to_ice(&v) {
-                                                    rtc.add_remote_candidate(c);
-                                                }
+                                                apply_remote_ice(&mut rtc, &mut ice_debug, &v);
                                             }
                                             Ok(LoopCmd::ApplyAnswer(v)) => {
-                                                if let Some(sdp_str) = v["sdp"]["sdp"].as_str().or_else(|| v["sdp"].as_str()) {
-                                                    if let Ok(answer) = SdpAnswer::from_sdp_string(sdp_str) {
-                                                        if let Some(pending) = pending_offer.take() {
-                                                            let _ = rtc.sdp_api().accept_answer(pending, answer);
-                                                        }
-                                                    }
-                                                }
+                                                apply_remote_answer(&mut rtc, &mut ice_debug, &mut pending_offer, &v);
                                             }
                                             Err(_) => break,
                                         }
@@ -233,18 +299,10 @@ pub async fn run(
                                                 break;
                                             }
                                             Ok(LoopCmd::AddIceCandidate(v)) => {
-                                                if let Some(c) = json_to_ice(&v) {
-                                                    rtc.add_remote_candidate(c);
-                                                }
+                                                apply_remote_ice(&mut rtc, &mut ice_debug, &v);
                                             }
                                             Ok(LoopCmd::ApplyAnswer(v)) => {
-                                                if let Some(sdp_str) = v["sdp"]["sdp"].as_str().or_else(|| v["sdp"].as_str()) {
-                                                    if let Ok(answer) = SdpAnswer::from_sdp_string(sdp_str) {
-                                                        if let Some(pending) = pending_offer.take() {
-                                                            let _ = rtc.sdp_api().accept_answer(pending, answer);
-                                                        }
-                                                    }
-                                                }
+                                                apply_remote_answer(&mut rtc, &mut ice_debug, &mut pending_offer, &v);
                                             }
                                             Err(_) => break,
                                         }
@@ -283,6 +341,9 @@ pub async fn run(
                 }
 
                 Ok(Output::Transmit(t)) => {
+                    // The first transmit after ICE reports Connected rides the
+                    // nominated pair — that is our selected-pair line.
+                    ice_debug.note_transmit(t.source, t.destination);
                     if let Some(ref mut relay) = turn_relay {
                         if t.source == relay.relay_addr {
                             // Relay traffic — wrap in Send indication
@@ -308,10 +369,23 @@ pub async fn run(
                 Ok(Output::Event(e)) => {
                     match e {
                         Event::IceConnectionStateChange(IceConnectionState::Disconnected) => {
+                            crate::commands::log::event("ICE connection state: disconnected");
                             let _ = event_tx.send(LoopEvent::Error(
                                 "ICE disconnected (network change or peer lost)".to_string(),
                             ));
                             return;
+                        }
+                        Event::IceConnectionStateChange(state) => {
+                            crate::commands::log::event(&format!(
+                                "ICE connection state: {}",
+                                format!("{state:?}").to_lowercase()
+                            ));
+                            if matches!(
+                                state,
+                                IceConnectionState::Connected | IceConnectionState::Completed
+                            ) {
+                                ice_debug.arm_pair_log();
+                            }
                         }
                         Event::ChannelOpen(id, _label) => {
                             if channel_id.map_or(true, |cid| cid == id) {

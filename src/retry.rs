@@ -23,6 +23,24 @@ pub const PEER_TIMEOUT_SECS: u64 = 10;
 /// Timeout waiting for DataChannel to open (ICE + DTLS).
 pub const CHANNEL_TIMEOUT_SECS: u64 = 10;
 
+/// Timeout waiting for the recipient's SDP answer after our offer went out.
+///
+/// Deliberately more generous than `PEER_TIMEOUT_SECS`/`CHANNEL_TIMEOUT_SECS`:
+/// by this point the recipient is already known to be present (`p2p:both-ready`
+/// fired), and before it can answer it must bind a UDP socket and, online, wait
+/// out a TURN allocation. What this bounds is the pathological case — the
+/// recipient never negotiates at all — which previously hung the sender forever
+/// with no output at any verbosity.
+pub const ANSWER_TIMEOUT_SECS: u64 = 30;
+
+/// Timeout for the `--sync --local` TCP data connection (task 062): the sender
+/// waiting to `accept`, the receiver waiting to `connect` + finish the handshake.
+///
+/// By this point signaling has already succeeded, so the only thing left that can
+/// stall is the data port itself (a firewall or endpoint agent dropping the SYN).
+/// Bounded on purpose — an unbounded wait here would repeat bug B3 / task 060.
+pub const SYNC_DATA_TIMEOUT_SECS: u64 = 30;
+
 /// Prompt user to manually retry after auto-retries are exhausted.
 /// Returns `true` if user wants to retry, `false` to abort.
 /// In non-interactive mode (piped stdin), returns `false`.
@@ -36,8 +54,10 @@ pub async fn prompt_manual() -> bool {
     if crate::commands::log::is_pipe() {
         return false;
     }
-    eprintln!("\x1b[1;33m\u{26a0}\x1b[0m The connection was not successful.");
-    eprint!("Press Enter to retry or Ctrl+C to quit\u{2026} ");
+    // Same margin as the log column this prompt interrupts. (task 067)
+    let margin = crate::commands::log::MARGIN;
+    eprintln!("{margin}\x1b[1;33m\u{26a0}\x1b[0m The connection was not successful.");
+    eprint!("{margin}Press Enter to retry or Ctrl+C to quit\u{2026} ");
     let mut buf = String::new();
     let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
     use tokio::io::AsyncBufReadExt;
@@ -46,7 +66,7 @@ pub async fn prompt_manual() -> bool {
         Ok(_) => {
             // Immediate feedback so a manual retry visibly does something (the web
             // shows "Reconnecting"); the next stage then waits for the peer.
-            crate::commands::log::step("\x1b[1;34m\u{21bb}\x1b[0m Reconnecting\u{2026}");
+            crate::commands::log::step_glyph("\x1b[1;34m\u{21bb}\x1b[0m", "Reconnecting\u{2026}");
             true
         }
     }

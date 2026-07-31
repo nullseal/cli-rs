@@ -14,6 +14,7 @@
 //   receiver.rs   — ReceiverPeer (accepts offer, receives data)
 
 mod event_loop;
+pub mod ice_log;
 pub mod net;
 mod receiver;
 mod sender;
@@ -33,7 +34,9 @@ use nullseal_turn::allocate::Credentials;
 
 // ── Re-exports ────────────────────────────────────────────────────────────────
 
+pub use ice_log::CandidateInfo;
 pub use net::discover_local_ip;
+pub use net::receiver_bind_ip;
 pub use receiver::ReceiverPeer;
 pub use sender::SenderPeer;
 
@@ -69,29 +72,44 @@ fn loopback_candidate_addr(local_addr: SocketAddr) -> Option<SocketAddr> {
     }
 }
 
-fn build_rtc(local_addr: SocketAddr) -> Result<Rtc> {
+/// Add a local candidate to `rtc` and record it for the verbose ICE log, so the
+/// operator can see exactly what was gathered (and, crucially, when nothing was).
+fn add_and_record(rtc: &mut Rtc, candidate: Candidate, gathered: &mut Vec<CandidateInfo>) {
+    if let Some(info) = ice_log::parse_candidate_line(&candidate.to_sdp_string()) {
+        gathered.push(info);
+    }
+    rtc.add_local_candidate(candidate);
+}
+
+/// Build the `Rtc` **and** the list of local candidates advertised on it.
+/// The list is what `ice_log::log_gathered` reports at `--verbose`.
+fn build_rtc(local_addr: SocketAddr) -> Result<(Rtc, Vec<CandidateInfo>)> {
     build_rtc_inner(local_addr, false)
 }
 
-fn build_rtc_relay_only(local_addr: SocketAddr) -> Result<Rtc> {
+fn build_rtc_relay_only(local_addr: SocketAddr) -> Result<(Rtc, Vec<CandidateInfo>)> {
     build_rtc_inner(local_addr, true)
 }
 
-fn build_rtc_inner(local_addr: SocketAddr, relay_only: bool) -> Result<Rtc> {
+fn build_rtc_inner(
+    local_addr: SocketAddr,
+    relay_only: bool,
+) -> Result<(Rtc, Vec<CandidateInfo>)> {
     let mut rtc = Rtc::new(Instant::now());
+    let mut gathered = Vec::new();
 
     if !relay_only {
         let candidate = Candidate::host(local_addr, "udp")
             .map_err(|e| anyhow::anyhow!("failed to create host candidate: {e}"))?;
-        rtc.add_local_candidate(candidate);
+        add_and_record(&mut rtc, candidate, &mut gathered);
 
         if let Some(lo) = loopback_candidate_addr(local_addr) {
             if let Ok(c) = Candidate::host(lo, "udp") {
-                rtc.add_local_candidate(c);
+                add_and_record(&mut rtc, c, &mut gathered);
             }
         }
     }
-    Ok(rtc)
+    Ok((rtc, gathered))
 }
 
 // ── TURN relay state ──────────────────────────────────────────────────────────
@@ -116,6 +134,7 @@ pub(crate) async fn setup_turn(
     local_addr: SocketAddr,
     ice_servers: &[ApiIceServer],
     rtc: &mut Rtc,
+    gathered: &mut Vec<CandidateInfo>,
 ) -> Option<TurnRelay> {
     // Find first TURN server with credentials
     let (turn_uri, username, credential) = ice_servers.iter().find_map(|s| {
@@ -149,11 +168,11 @@ pub(crate) async fn setup_turn(
 
     // Inject relay candidate
     if let Ok(c) = Candidate::relayed(alloc.relayed, local_addr, "udp") {
-        rtc.add_local_candidate(c);
+        add_and_record(rtc, c, gathered);
     }
     // Inject server-reflexive candidate
     if let Ok(c) = Candidate::server_reflexive(alloc.srflx, local_addr, "udp") {
-        rtc.add_local_candidate(c);
+        add_and_record(rtc, c, gathered);
     }
 
     Some(TurnRelay {
@@ -188,5 +207,33 @@ mod tests {
     fn build_rtc_succeeds_for_lan_and_loopback() {
         assert!(build_rtc("192.168.1.50:54321".parse().unwrap()).is_ok());
         assert!(build_rtc("127.0.0.1:40000".parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn build_rtc_records_the_candidates_it_gathered() {
+        // A LAN address yields host + loopback; both must show up in the list the
+        // verbose ICE log reports.
+        let (_rtc, gathered) = build_rtc("192.168.1.50:54321".parse().unwrap()).unwrap();
+        assert_eq!(
+            gathered.iter().map(|c| c.describe()).collect::<Vec<_>>(),
+            vec!["host udp 192.168.1.50:54321", "host udp 127.0.0.1:54321"],
+        );
+
+        let (_rtc, lo_only) = build_rtc("127.0.0.1:40000".parse().unwrap()).unwrap();
+        assert_eq!(
+            lo_only.iter().map(|c| c.describe()).collect::<Vec<_>>(),
+            vec!["host udp 127.0.0.1:40000"],
+        );
+    }
+
+    #[test]
+    fn relay_only_gathers_nothing_without_turn() {
+        // The exact silent-hang shape: relay-only + no TURN allocation means the
+        // SDP goes out empty. `log_gathered` must then emit NO_LOCAL_CANDIDATES.
+        let (_rtc, gathered) = build_rtc_relay_only("192.168.1.50:54321".parse().unwrap()).unwrap();
+        assert!(
+            gathered.is_empty(),
+            "relay-only gathers nothing until setup_turn injects the relay candidate",
+        );
     }
 }
