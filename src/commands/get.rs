@@ -758,9 +758,10 @@ pub async fn run_local(
         .ok_or_else(|| anyhow::anyhow!("socket closed before joined"))?;
     super::log::step("Connected. Waiting for sender…");
 
-    let bind_ip: Option<std::net::IpAddr> = addr.split(':')
-        .next()
-        .and_then(|h| h.parse().ok());
+    // `addr` is the SENDER's address. Our ICE host candidate must advertise
+    // *our* address, not theirs — see `webrtc::receiver_bind_ip` (loopback
+    // senders keep loopback so same-machine runs are unchanged).
+    let bind_ip: Option<std::net::IpAddr> = crate::webrtc::receiver_bind_ip(&addr);
 
     // Shared receive types (sha256_bytes is already in module scope)
     use crate::crypto::{StreamDecryptor, StreamEncryptionMetadata};

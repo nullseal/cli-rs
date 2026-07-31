@@ -36,6 +36,7 @@ use nullseal_turn::allocate::Credentials;
 
 pub use ice_log::CandidateInfo;
 pub use net::discover_local_ip;
+pub use net::receiver_bind_ip;
 pub use receiver::ReceiverPeer;
 pub use sender::SenderPeer;
 
